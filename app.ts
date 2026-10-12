@@ -37,11 +37,12 @@ const ATTENTION_ORDER = [
 ];
 
 const HELP_TEXT = [
-  "Ask me about Syncro tickets, customers, workload, or what to do next.",
+  "Ask me about Syncro tickets: status, history, customer, assignee, age, problem type, tags, assets, SLA, workload, or what to do next.",
+  "In a channel, reply in the thread so I keep that conversation. A direct message or /msp works too.",
   "Examples:",
   "• Show me overdue tickets and tell me which ones need attention first.",
   "• What should we do about the oldest ticket?",
-  "• Who has the heaviest open queue?",
+  "• Which open tickets are waiting on the customer?",
   "I can draft notes and customer replies. I cannot update Syncro or send those messages.",
 ].join("\n");
 
@@ -272,6 +273,7 @@ export interface ServerConfig {
   dueSoonHours: number;
   maxPages: number;
   timeoutMs: number;
+  allowedChannelIds: Set<string> | null;
 }
 
 export interface SyncroConfig {
@@ -347,6 +349,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfig {
         ? "https://openrouter.ai/api/v1"
         : "https://api.openai.com/v1",
     port: parsePositiveInt(envValue(env, "PORT"), 3000, "PORT", 1, 65535),
+    allowedChannelIds: parseAllowlist(envValue(env, "SLACK_CHANNEL_IDS")),
     ...sharedLimits(env),
   };
 }
@@ -610,9 +613,10 @@ export function normalizeTicket(raw: unknown, ctx: NormalizeContext): TicketSumm
     ? round1((due.getTime() - ctx.now.getTime()) / 3_600_000)
     : null;
   const dueSoon = dueInHours != null && dueInHours <= ctx.dueSoonHours;
-  const tags = Array.isArray(raw.tag_list)
-    ? raw.tag_list.filter((tag): tag is string => typeof tag === "string").slice(0, 12)
-    : [];
+  const listedTags = Array.isArray(raw.tag_list) ? raw.tag_list : [];
+  const alternateTags = Array.isArray(raw.tags) ? raw.tags : [];
+  const tagSource = listedTags.length ? listedTags : alternateTags;
+  const tags = tagSource.filter((tag): tag is string => typeof tag === "string" && tag.trim().length > 0).slice(0, 12);
   const summary: TicketSummary = {
     id,
     number: asId(raw.number),
@@ -775,6 +779,10 @@ const searchTicketsSchema = z.object({
   max_age_days: z.number().min(0).max(3650).optional(),
   unassigned_only: z.boolean().optional(),
   customer_reply_only: z.boolean().optional(),
+  problem_type: z.string().trim().min(2).max(80).optional(),
+  tag: z.string().trim().min(2).max(40).optional(),
+  contact: z.string().trim().min(2).max(80).optional(),
+  ticket_type: z.string().trim().min(2).max(80).optional(),
   sort: z.enum(["attention", "oldest", "newest", "most_overdue", "updated"]).optional(),
   limit: z.number().int().min(1).max(20).optional(),
 });
@@ -865,7 +873,15 @@ function localTicketFilter(
   if (args.min_age_days != null && ticket.ageDays < args.min_age_days) return false;
   if (args.max_age_days != null && ticket.ageDays > args.max_age_days) return false;
   if (args.priority && ticket.priority?.toLowerCase() !== args.priority.toLowerCase()) return false;
+  if (args.problem_type && !includesFold(ticket.problemType, args.problem_type)) return false;
+  if (args.tag && !ticket.tags.some((tag) => includesFold(tag, args.tag ?? ""))) return false;
+  if (args.contact && !includesFold(ticket.contactName, args.contact)) return false;
+  if (args.ticket_type && !includesFold(ticket.ticketType, args.ticket_type)) return false;
   return true;
+}
+
+function includesFold(haystack: string | null | undefined, needle: string): boolean {
+  return (haystack ?? "").toLowerCase().includes(needle.toLowerCase());
 }
 
 function sortTickets(tickets: TicketSummary[], sort: SearchTicketsArgs["sort"]): TicketSummary[] {
@@ -970,6 +986,10 @@ export async function searchTickets(
     args.max_age_days != null ? `max_age_days=${args.max_age_days}` : null,
     args.unassigned_only ? "unassigned_only" : null,
     args.customer_reply_only ? "customer_reply_only" : null,
+    args.problem_type ? `problem_type~${args.problem_type} (local)` : null,
+    args.tag ? `tag~${args.tag} (local)` : null,
+    args.contact ? `contact~${args.contact} (local)` : null,
+    args.ticket_type ? `ticket_type~${args.ticket_type} (local)` : null,
   ].filter((item): item is string => Boolean(item));
   return {
     tickets: ordered,
@@ -983,7 +1003,7 @@ export async function searchTickets(
     provenance: scanned.provenance,
     note: scanned.provenance.truncated
       ? "Syncro had more pages than this request loaded. Filters and counts may be incomplete."
-      : "Priority, age, overdue, unassigned, and customer-reply filters run locally. Syncro's ticket list does not document those query parameters.",
+      : "Priority, age, overdue, unassigned, customer-reply, problem type, tag, contact, and ticket type filters run locally. Syncro's ticket list does not document those query parameters.",
   };
 }
 
@@ -1425,7 +1445,7 @@ const objectSchema = (properties: Record<string, JsonSchemaProperty>, required: 
 const TOOLS: ToolDefinition[] = [
   {
     name: "search_tickets",
-    description: "Search Syncro tickets. Defaults to open tickets with the documented status filter Not Closed. Priority, overdue, age, unassigned, and customer_reply filters are applied locally because the list endpoint does not document them. Results include an attention order calculated in code.",
+    description: "Search Syncro tickets for any read-only ticket question: status, number, subject text, customer, contact, assignee, dates, problem type, ticket type, or tag. Defaults to open tickets with the documented status filter Not Closed. Priority, overdue, age, unassigned, customer_reply, problem_type, tag, contact, and ticket_type filters are applied locally because the list endpoint does not document them. Use include_closed with a query, number, customer, assignee, status, or date when the question is about resolved tickets. Results include an attention order calculated in code.",
     parameters: objectSchema({
       query: { type: "string", description: "Free-text query passed to Syncro." },
       status: { type: "string", description: "Exact Syncro status. Not Closed is a documented open-ticket filter." },
@@ -1444,6 +1464,10 @@ const TOOLS: ToolDefinition[] = [
       max_age_days: { type: "number" },
       unassigned_only: { type: "boolean" },
       customer_reply_only: { type: "boolean" },
+      problem_type: { type: "string", description: "Problem type text, matched locally. Not a Syncro query parameter." },
+      tag: { type: "string", description: "Tag text, matched locally against tag_list. Not a Syncro query parameter." },
+      contact: { type: "string", description: "Contact name, matched locally. Not a Syncro query parameter." },
+      ticket_type: { type: "string", description: "Ticket type name, matched locally. Not a Syncro query parameter." },
       sort: { type: "string", enum: ["attention", "oldest", "newest", "most_overdue", "updated"] },
       limit: { type: "integer" },
     }),
@@ -1563,7 +1587,9 @@ export function buildSystemPrompt(): string {
   return [
     "You are an MSP service-desk advisor for technicians, service managers, and owners.",
     "Answer from Syncro data retrieved by tools. You do not have HTTP access, credentials, or permission to change Syncro.",
-    "Call a tool before stating ticket counts, statuses, assignees, ages, or SLA facts.",
+    "Any read-only Syncro ticket question is in scope, including ones that are not in the examples: status, subject, number, customer, contact name, assignee, age, due date, SLA, priority, problem type, tags, comments, assets, timers, workload, and what to do next.",
+    "Follow-ups such as that ticket, the oldest, or what should we do refer to tickets already in this thread. Look them up again before stating new facts.",
+    "Call a tool before stating any ticket fact, count, status, assignee, age, comment, asset, or SLA field. If the tools cannot answer, say what is missing instead of refusing the question.",
     "Preserve the attention order returned by tools. It is calculated in code.",
     "Keep simple answers short.",
     "For troubleshooting, workload, SLA, or what-should-we-do questions, use these sections: Findings, Assessment, Recommended next steps, Risks or uncertainties, Supporting ticket references.",
@@ -1577,7 +1603,7 @@ export function buildSystemPrompt(): string {
     "Mention ticket number, status, priority or unset, assignee, and the Syncro URL for every ticket you cite.",
     "If a tool says data was truncated or a field was not returned, say that plainly.",
     "You are read-only. Do not claim that you updated a ticket, sent an email, or assigned a technician.",
-    "Tool choice: overdue tickets, SLA risk, or what needs attention first uses get_sla_risk. Counts and recurring problem types use get_ticket_metrics. Queue balance uses get_technician_workload. Troubleshooting a ticket uses get_ticket_details before the recommendation. Name or id lookup uses search_customers or search_tickets.",
+    "Tool choice: overdue tickets, SLA risk, or what needs attention first uses get_sla_risk. Counts and recurring problem types use get_ticket_metrics. Queue balance uses get_technician_workload. A specific ticket, its comments, assets, timers, custom fields, or a troubleshooting recommendation uses get_ticket_details. Finding tickets by status, customer, contact, assignee, text, date, problem type, ticket type, or tag uses search_tickets. Closed or resolved tickets need include_closed plus a query, number, customer, assignee, status, or date. Customer names use search_customers, then get_customer_details when one customer is identified.",
   ].join("\n");
 }
 
@@ -1682,7 +1708,15 @@ function toSlackMrkdwn(text: string): string {
   return text.replace(/\*\*(.+?)\*\*/g, "*$1*");
 }
 
-async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolChoice: "auto" | "none"): Promise<ChatMessage> {
+export function prefersToolLookup(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length <= 48 && /^(?:thanks|thank you|thx|ty|ok|okay|got it|hello|hi|hey|yo|good morning|good afternoon)[.!\s]*$/i.test(trimmed)) {
+    return false;
+  }
+  return true;
+}
+
+async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolChoice: "auto" | "none" | "required"): Promise<ChatMessage> {
   const payload = {
     model: input.llm.model,
     temperature: 0.2,
@@ -1770,6 +1804,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     },
   ];
   const toolResults: unknown[] = [];
+  const lookupRequired = prefersToolLookup(input.userText);
   const ctx: ToolContext = {
     syncro: input.syncro,
     now,
@@ -1780,7 +1815,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     if (Date.now() > deadline) {
       throw new AppError("That request took too long. Try a narrower question.", "turn_timeout", true);
     }
-    const assistant = await completeChat(input, messages, "auto");
+    const assistant = await completeChat(input, messages, round === 0 && lookupRequired ? "required" : "auto");
     messages.push(assistant);
     if (!assistant.tool_calls?.length) {
       const reply = assistant.content?.trim();
@@ -1918,6 +1953,49 @@ function stripMention(text: string): string {
   return text.replace(/<@[A-Z0-9]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
+const ANSWERABLE_CHANNEL_TYPES = new Set(["im", "mpim", "channel", "group"]);
+
+export interface SlackInboundEvent {
+  type?: unknown;
+  channel?: unknown;
+  channel_type?: unknown;
+  user?: unknown;
+  text?: unknown;
+  ts?: unknown;
+  thread_ts?: unknown;
+  subtype?: unknown;
+  bot_id?: unknown;
+  bot_profile?: unknown;
+}
+
+function slackChannelKind(event: SlackInboundEvent): string {
+  if (typeof event.channel_type === "string" && ANSWERABLE_CHANNEL_TYPES.has(event.channel_type)) {
+    return event.channel_type;
+  }
+  if (typeof event.channel === "string" && event.channel.startsWith("D")) return "im";
+  if (event.type === "app_mention" || event.type === "message") return "channel";
+  return "unknown";
+}
+
+export function shouldAnswerSlackEvent(event: SlackInboundEvent, allowedChannelIds: Set<string> | null): boolean {
+  if (event.subtype || event.bot_id || event.bot_profile) return false;
+  if (typeof event.user !== "string" || !event.user) return false;
+  if (typeof event.text !== "string") return false;
+  if (typeof event.ts !== "string" || !event.ts) return false;
+  if (typeof event.channel !== "string" || !event.channel) return false;
+  if (event.type !== "app_mention" && event.type !== "message") return false;
+  const kind = slackChannelKind(event);
+  if (!ANSWERABLE_CHANNEL_TYPES.has(kind)) return false;
+  if (kind === "im") return true;
+  if (allowedChannelIds && !allowedChannelIds.has(event.channel)) return false;
+  return true;
+}
+
+export function slackMemoryKey(channel: string, ts: string, threadTs: string | undefined, channelType: string | undefined): string {
+  if (channelType === "im" || channel.startsWith("D")) return `im:${channel}`;
+  return `${channel}:${threadTs || ts}`;
+}
+
 const recentEvents = new Map<string, number>();
 
 function firstDelivery(id: string): boolean {
@@ -2028,33 +2106,51 @@ async function startServer(): Promise<void> {
   });
 
   app.event("app_mention", async ({ event, say }) => {
-    if (!event.user) return;
+    const inbound: SlackInboundEvent = {
+      type: "app_mention",
+      channel: event.channel,
+      channel_type: "channel_type" in event ? event.channel_type : undefined,
+      user: event.user,
+      text: event.text,
+      ts: event.ts,
+      thread_ts: event.thread_ts,
+    };
+    if (!shouldAnswerSlackEvent(inbound, config.allowedChannelIds)) return;
     const threadTs = event.thread_ts ?? event.ts;
+    const channelType = typeof inbound.channel_type === "string" ? inbound.channel_type : undefined;
     await answer(
       `${event.channel}:${event.ts}`,
-      event.user,
-      `${event.channel}:${threadTs}`,
+      event.user ?? "",
+      slackMemoryKey(event.channel, event.ts, event.thread_ts, channelType),
       event.text ?? "",
       (text) => say({ text, thread_ts: threadTs }),
     );
   });
 
   app.message(async ({ message, say }) => {
-    if (message.subtype) return;
-    if (!("user" in message) || typeof message.user !== "string") return;
-    if (!("text" in message) || typeof message.text !== "string") return;
-    if (!("ts" in message) || typeof message.ts !== "string") return;
-    if (!("channel" in message) || typeof message.channel !== "string") return;
-    if ("bot_id" in message && message.bot_id) return;
-    const channelType = "channel_type" in message ? message.channel_type : undefined;
-    if (channelType !== "im") return;
-    const threadTs = "thread_ts" in message && typeof message.thread_ts === "string" ? message.thread_ts : message.ts;
+    if (!("user" in message) || !("text" in message) || !("ts" in message) || !("channel" in message)) return;
+    const channelType = "channel_type" in message && typeof message.channel_type === "string" ? message.channel_type : undefined;
+    const threadTs = "thread_ts" in message && typeof message.thread_ts === "string" ? message.thread_ts : undefined;
+    const inbound: SlackInboundEvent = {
+      type: "message",
+      channel: message.channel,
+      channel_type: channelType,
+      user: message.user,
+      text: message.text,
+      ts: message.ts,
+      thread_ts: threadTs,
+      subtype: message.subtype,
+      bot_id: "bot_id" in message ? message.bot_id : undefined,
+    };
+    if (!shouldAnswerSlackEvent(inbound, config.allowedChannelIds)) return;
+    if (typeof message.user !== "string" || typeof message.text !== "string" || typeof message.ts !== "string" || typeof message.channel !== "string") return;
+    const replyThread = threadTs ?? message.ts;
     await answer(
       `${message.channel}:${message.ts}`,
       message.user,
-      `${message.channel}:${threadTs}`,
+      slackMemoryKey(message.channel, message.ts, threadTs, channelType),
       message.text,
-      (text) => say({ text, thread_ts: threadTs }),
+      (text) => say({ text, thread_ts: replyThread }),
     );
   });
 
@@ -2212,21 +2308,26 @@ export async function handleWorkerRequest(
     return new Response("", { status: 200 });
   }
   const event = payload.event;
+  if (!shouldAnswerSlackEvent(event, config.allowedChannelIds)) {
+    return new Response("", { status: 200 });
+  }
   if (typeof event.user !== "string" || typeof event.text !== "string" || typeof event.ts !== "string" || typeof event.channel !== "string") {
     return new Response("", { status: 200 });
   }
-  if (event.subtype || event.bot_id) return new Response("", { status: 200 });
-  const isMention = event.type === "app_mention";
-  const isDirectMessage = event.type === "message" && event.channel_type === "im";
-  if (!isMention && !isDirectMessage) return new Response("", { status: 200 });
-  const threadTs = typeof event.thread_ts === "string" ? event.thread_ts : event.ts;
-  const eventId = typeof payload.event_id === "string" ? payload.event_id : `${event.channel}:${event.ts}`;
+  const channel = event.channel;
+  const user = event.user;
+  const text = event.text;
+  const ts = event.ts;
+  const threadTs = typeof event.thread_ts === "string" ? event.thread_ts : undefined;
+  const channelType = typeof event.channel_type === "string" ? event.channel_type : undefined;
+  const replyThread = threadTs ?? ts;
+  // Mentions also arrive as message events. Dedupe on channel and ts, not event_id.
   ctx.waitUntil(assistant.answer(
-    eventId,
-    event.user,
-    `${event.channel}:${threadTs}`,
-    event.text,
-    (text) => postSlackMessage(fetchImpl, config.slackBotToken, event.channel as string, threadTs, text),
+    `${channel}:${ts}`,
+    user,
+    slackMemoryKey(channel, ts, threadTs, channelType),
+    text,
+    (reply) => postSlackMessage(fetchImpl, config.slackBotToken, channel, replyThread, reply),
   ).catch((error: unknown) => {
     console.error(safeError(error));
   }));
