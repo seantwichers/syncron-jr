@@ -1,31 +1,26 @@
 {
   "name": "syncron-jr",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Slack assistant for MSP technicians, grounded in read-only Syncro data.",
   "type": "module",
+  "description": "BDK Slack assistant for MSP technicians, grounded in read-only Syncro data.",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "scripts": {
-    "dev": "tsx app.ts",
-    "start": "tsx app.ts",
-    "check:syncro": "tsx app.ts --check-syncro",
+    "check": "tsc --noEmit",
+    "dev": "bdk dev",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint app.ts test"
+    "validate": "bdk validate --dir ."
   },
   "dependencies": {
-    "@slack/bolt": "^4.4.0",
-    "zod": "^3.25.76"
+    "@cursor/bdk": "^0.2.23",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.36.0",
-    "@types/node": "^22.18.6",
-    "eslint": "^9.36.0",
-    "tsx": "^4.20.5",
-    "typescript": "^5.9.2",
-    "typescript-eslint": "^8.44.1",
+    "@types/node": "^22.14.0",
+    "typescript": "~5.9.2",
     "vitest": "^3.2.4"
   }
 }

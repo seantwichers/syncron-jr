@@ -1,9 +1,5 @@
-node_modules/
-dist/
-coverage/
-.wrangler/
+node_modules
 .env
-.env.*
-!.env.example
-*.log
-.DS_Store
+.env.local
+.agent-serve
+memory

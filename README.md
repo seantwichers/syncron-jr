@@ -1,120 +1,59 @@
-# MSP Slack assistant
+# Syncron Jr
 
-A single-file Slack assistant for MSP technicians, service managers, and owners. Ask a question in Slack and the app reads Syncro, calculates ticket age and attention order in code, then asks the configured language model for a short, evidence-based recommendation.
-
-The application logic is in `app.ts`. It does not write to Syncro.
+BDK Slack assistant for MSP technicians, service managers, and owners. Ask in Slack; the agent reads Syncro (read-only), ranks attention in code, and answers from tool evidence.
 
 ## What it can answer
 
-- Overdue and at-risk tickets, with a stable attention order.
-- Ticket detail, recent comments, linked assets, and timer notes.
-- Customer lookup without sending email, phone, or street address to the model.
-- Open-ticket counts, aging, recurring problem types, and assignee queue size.
-- A troubleshooting or escalation suggestion grounded in the retrieved ticket.
+- Overdue and at-risk tickets, with a stable attention order
+- Ticket detail, recent comments, linked assets, and timer notes
+- Customer lookup without sending email, phone, or street address to the model
+- Open-ticket counts, aging, recurring problem types, and assignee queue size
+- Troubleshooting or escalation suggestions grounded in retrieved tickets
 
-Follow-up questions stay in the Slack thread. Mention the bot, send it a direct message, or use `/msp`.
+Follow-ups stay in the Slack thread. Mention the bot or DM it.
 
-## Run
+## Develop
 
 ```bash
 npm install
-cp .env.example .env
-npm run dev
+cp .env.example .env.local
+# Mint Slack tokens (writes SYNCRON_JR_SLACK_* into .env.local):
+npx bdk slack create --dir . --name "Syncron Jr"
+npx bdk validate --dir .
+npx bdk dev
 ```
-
-`npm run dev` loads `.env` when that file exists and starts the assistant.
 
 | Command | Purpose |
 | --- | --- |
-| `npm run dev` | Start the Slack app |
-| `npm test` | Run mocked tool and agent tests |
-| `npm run typecheck` | Typecheck `app.ts` and the tests |
-| `npm run lint` | Lint `app.ts` and the tests |
-| `npm run check:syncro` | Read live open tickets and print a redacted summary |
-
-`SYNCRO_LIVE=1 npm test` also runs the live Syncro test. It needs `SYNCRO_BASE_URL` and `SYNCRO_API_KEY`.
+| `npm run dev` | Serve locally with playground |
+| `npm test` | Mocked Syncro unit tests |
+| `npm run check` | Typecheck |
+| `npx bdk validate --dir .` | Validate agent surface |
+| `npx bdk slack doctor --prefix SYNCRON_JR` | Check Slack tokens |
 
 ## Configure
 
-Copy `.env.example`. Do not commit `.env`.
+Required secrets:
 
-Required for the Slack app:
-
-- `SLACK_BOT_TOKEN`
-- `SLACK_SIGNING_SECRET`
 - `SYNCRO_BASE_URL` such as `https://your-subdomain.syncromsp.com`
 - `SYNCRO_API_KEY`
-- `LLM_API_KEY`
 
-`LLM_PROVIDER` is `openai` or `openrouter`. Both use `POST /chat/completions` with the same tool definitions. `LLM_BASE_URL` overrides the provider default when you need a proxy. `LLM_MODEL` defaults to `gpt-4o-mini` for OpenAI and `openai/gpt-4o-mini` for OpenRouter.
+Slack tokens come from `bdk slack create` (`SYNCRON_JR_SLACK_BOT_TOKEN`, `SYNCRON_JR_SLACK_APP_TOKEN`).
 
-Set `SLACK_APP_TOKEN` (`xapp-`, scope `connections:write`) to use Socket Mode. Leave it empty to use HTTP on `PORT` (default `3000`). Slack signs requests and Bolt checks them with `SLACK_SIGNING_SECRET`.
+Optional:
 
-`SLACK_ALLOWED_USER_IDS` is an optional comma-separated list of Slack user IDs. Empty means any user in the workspace can ask. That list is not role-based authorization. One process serves one Syncro account; run another process with its own environment for another organization.
+- `SLACK_ALLOWED_USER_IDS` — comma-separated Slack user IDs; empty allows the workspace
+- `SLA_DUE_SOON_HOURS` (default 24)
+- `SYNCRO_MAX_PAGES` (default 4)
+- `SYNCRO_TIMEOUT_MS` (default 20000)
 
-`SLA_DUE_SOON_HOURS` (default 24) is the local rule for “due soon.” Syncro’s own `sla_breached` and `sla_breaching_soon` fields are reported when the ticket list returns them. Overdue means `due_date` is in the past and `resolved_at` is empty.
-
-The Syncro token needs read access to tickets, customers, and assets. This app calls only:
-
-- `GET /tickets` and `GET /tickets/{id}`
-- `GET /tickets/{id}/comments`
-- `GET /tickets/settings`
-- `GET /users` when settings does not include technicians
-- `GET /customers` and `GET /customers/{id}`
-- `GET /customer_assets`
-
-Priority, age, overdue, assignment gaps, and attention order are calculated locally. Those are not documented list filters. Page size is whatever Syncro returns, and each tool stops after `SYNCRO_MAX_PAGES` (default 4).
-
-## Slack app
-
-Create a Slack app and install it to the workspace.
-
-Bot scopes:
-
-- `app_mentions:read`
-- `chat:write`
-- `commands`
-- `im:history`
-- `im:read`
-- `im:write`
-
-Bot events: `app_mention`, `message.im`.
-
-Slash command: `/msp`.
-
-Socket Mode is the simplest development setup. For HTTP mode, point the Slack request URL at `https://your-host/slack/events` and keep `SLACK_APP_TOKEN` empty. `GET /health` returns `{ "ok": true }`.
-
-## Cloudflare
-
-This project is a Worker, not a static site. `wrangler.jsonc` is what stops Wrangler from failing with "Could not detect a directory containing static files". Do not deploy it as Cloudflare Pages and do not add a dummy `index.html` just to satisfy that check.
+## Deploy
 
 ```bash
-npx wrangler login
-npx wrangler secret put SLACK_BOT_TOKEN
-npx wrangler secret put SLACK_SIGNING_SECRET
-npx wrangler secret put SYNCRO_BASE_URL
-npx wrangler secret put SYNCRO_API_KEY
-npx wrangler secret put LLM_API_KEY
-npx wrangler secret put LLM_PROVIDER
-npx wrangler deploy
+git push
+npx bdk deploy --dir .
+npx bdk secrets set syncron-jr SYNCRO_BASE_URL
+npx bdk secrets set syncron-jr SYNCRO_API_KEY
 ```
 
-Leave `SLACK_APP_TOKEN` unset on Cloudflare. Point the Slack request URL at the workers.dev URL. The Worker accepts events and `/msp` on any POST path, acknowledges Slack immediately, then posts the reply. `GET /` and `GET /health` return `{ "ok": true }`.
-
-Local development stays `npm run dev`.
-
-## Behavior
-
-Simple questions stay short. Troubleshooting and management questions use Findings, Assessment, Recommended next steps, Risks or uncertainties, and Supporting ticket references.
-
-Likely causes are labeled as hypotheses. The assistant can draft an internal note or a customer reply and will say that the draft was not sent. It does not update tickets, send mail, close tickets, or run remote actions.
-
-Ticket text is treated as untrusted. Instructions found in a ticket cannot change these rules, and tool arguments are validated before a Syncro call. Credentials stay in the server environment and are not sent to the model.
-
-## Checks
-
-The mocked suite covers pagination, local overdue filtering, attention order, redaction, allowlisting, Slack signature verification, and the shared OpenAI/OpenRouter tool loop.
-
-A live read against one Syncro account scanned 40 open tickets, calculated 26 overdue from `due_date`, and loaded the oldest open ticket (`#28641`) with its comment history. Syncro returned `sla_breached: false` on that set, and priority was unset, so the attention order came from due date and `customer_reply` rather than a breach flag or priority label.
-
-Slack delivery and a live model completion were not run. They need `SLACK_*` and `LLM_API_KEY`. A passing mock test does not prove that a particular Slack workspace or model account is configured.
+Use a Cursor service account for hosted deploy. Redeploy after setting secrets.
