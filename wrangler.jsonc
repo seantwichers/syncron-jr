@@ -1,0 +1,12 @@
+{
+  // This is a Worker, not a static site. Wrangler autoconfig looks for HTML
+  // when this file is absent and fails with "Could not detect a directory
+  // containing static files".
+  "name": "syncron-jr",
+  "main": "app.ts",
+  "compatibility_date": "2026-10-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  }
+}

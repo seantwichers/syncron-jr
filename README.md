@@ -84,6 +84,25 @@ Slash command: `/msp`.
 
 Socket Mode is the simplest development setup. For HTTP mode, point the Slack request URL at `https://your-host/slack/events` and keep `SLACK_APP_TOKEN` empty. `GET /health` returns `{ "ok": true }`.
 
+## Cloudflare
+
+This project is a Worker, not a static site. `wrangler.jsonc` is what stops Wrangler from failing with "Could not detect a directory containing static files". Do not deploy it as Cloudflare Pages and do not add a dummy `index.html` just to satisfy that check.
+
+```bash
+npx wrangler login
+npx wrangler secret put SLACK_BOT_TOKEN
+npx wrangler secret put SLACK_SIGNING_SECRET
+npx wrangler secret put SYNCRO_BASE_URL
+npx wrangler secret put SYNCRO_API_KEY
+npx wrangler secret put LLM_API_KEY
+npx wrangler secret put LLM_PROVIDER
+npx wrangler deploy
+```
+
+Leave `SLACK_APP_TOKEN` unset on Cloudflare. Point the Slack request URL at the workers.dev URL. The Worker accepts events and `/msp` on any POST path, acknowledges Slack immediately, then posts the reply. `GET /` and `GET /health` return `{ "ok": true }`.
+
+Local development stays `npm run dev`.
+
 ## Behavior
 
 Simple questions stay short. Troubleshooting and management questions use Findings, Assessment, Recommended next steps, Risks or uncertainties, and Supporting ticket references.

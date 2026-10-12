@@ -1930,15 +1930,20 @@ function firstDelivery(id: string): boolean {
   return true;
 }
 
-async function startServer(): Promise<void> {
-  const config = loadServerConfig(process.env);
-  const memory = new ConversationMemory();
+interface AssistantOptions {
+  fetchImpl?: FetchLike;
+  memory?: ConversationMemory;
+}
+
+function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
+  const memory = options.memory ?? new ConversationMemory();
   const syncro = new SyncroClient({
     apiBase: config.syncroApiBase,
     webOrigin: config.syncroWebOrigin,
     apiKey: config.syncroApiKey,
     timeoutMs: config.timeoutMs,
     maxPages: config.maxPages,
+    fetchImpl: options.fetchImpl,
     authorize: () => authorizeSlack(config.allowedUserIds),
     budget: {
       consume() {
@@ -1964,15 +1969,9 @@ async function startServer(): Promise<void> {
           baseUrl: config.llmBaseUrl,
         },
         secrets,
+        fetchImpl: options.fetchImpl,
       })),
     );
-
-  const postChunks = async (
-    post: (text: string) => Promise<unknown>,
-    text: string,
-  ) => {
-    for (const chunk of chunkSlackText(text)) await post(chunk);
-  };
 
   const answer = async (
     eventId: string,
@@ -2001,13 +2000,20 @@ async function startServer(): Promise<void> {
         allowedUserIds: config.allowedUserIds,
         respond: (history, userText) => respond(slackUserId, history, userText),
       });
-      await postChunks(post, reply);
+      for (const chunk of chunkSlackText(reply)) await post(chunk);
     } catch (error) {
       const id = correlationId();
       console.error(`[msp-agent] ${id} ${safeError(error)}`);
       await post(publicError(error, id));
     }
   };
+
+  return { answer, memory };
+}
+
+async function startServer(): Promise<void> {
+  const config = loadServerConfig(process.env);
+  const { answer } = createAssistant(config);
 
   const socketMode = Boolean(config.slackAppToken);
   const app = new App({
@@ -2075,6 +2081,163 @@ async function startServer(): Promise<void> {
   console.log(`MSP assistant listening in ${socketMode ? "socket" : "http"} mode on port ${config.port}.`);
   console.log(`Syncro ${config.syncroWebOrigin}. LLM ${config.llmProvider} / ${config.llmModel}.`);
 }
+
+const workerMemory = new ConversationMemory();
+
+interface WorkerExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
+function bindingEnv(bindings: Record<string, unknown>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(bindings)) {
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+async function slackRequestIsSigned(secret: string, body: string, timestamp: string, signature: string): Promise<boolean> {
+  const seconds = Number(timestamp);
+  if (!Number.isFinite(seconds) || Math.abs(Date.now() / 1000 - seconds) > 5 * 60) return false;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(`v0:${timestamp}:${body}`));
+  const hex = Array.from(new Uint8Array(mac), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  let mismatch = hex.length + 3 === signature.length ? 0 : 1;
+  const expected = `v0=${hex}`;
+  const length = Math.max(expected.length, signature.length);
+  for (let index = 0; index < length; index += 1) {
+    mismatch |= (expected.charCodeAt(index) || 0) ^ (signature.charCodeAt(index) || 0);
+  }
+  return mismatch === 0;
+}
+
+async function postSlackMessage(fetchImpl: FetchLike, token: string, channel: string, threadTs: string, text: string): Promise<void> {
+  const response = await fetchImpl("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({ channel, text, ...(threadTs ? { thread_ts: threadTs } : {}) }),
+  });
+  const payload: unknown = await response.json().catch(() => null);
+  const errorCode = isRecord(payload) && typeof payload.error === "string" ? payload.error : "";
+  if (!response.ok || (isRecord(payload) && payload.ok === false)) {
+    const suffix = /^[a-z0-9_]+$/.test(errorCode) ? ` (${errorCode})` : "";
+    throw new AppError(`Slack did not accept the reply${suffix}.`, "slack_api", true);
+  }
+}
+
+async function postSlackResponseUrl(fetchImpl: FetchLike, responseUrl: string, text: string): Promise<void> {
+  const response = await fetchImpl(responseUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ response_type: "ephemeral", text }),
+  });
+  if (!response.ok) throw new AppError("Slack did not accept the slash-command reply.", "slack_api", true);
+}
+
+export interface WorkerRequestOptions {
+  fetchImpl?: FetchLike;
+  memory?: ConversationMemory;
+}
+
+export async function handleWorkerRequest(
+  request: Request,
+  bindings: Record<string, unknown>,
+  ctx: WorkerExecutionContext,
+  options: WorkerRequestOptions = {},
+): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+    return Response.json({ ok: true, service: "msp-assistant" });
+  }
+  if (request.method !== "POST") return new Response("Not found", { status: 404 });
+
+  let config: ServerConfig;
+  try {
+    config = loadServerConfig(bindingEnv(bindings));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : "Configuration failed.");
+    return Response.json({ ok: false }, { status: 500 });
+  }
+
+  const body = await request.text();
+  const timestamp = request.headers.get("x-slack-request-timestamp") ?? "";
+  const signature = request.headers.get("x-slack-signature") ?? "";
+  if (!await slackRequestIsSigned(config.slackSigningSecret, body, timestamp, signature)) {
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const assistant = createAssistant(config, { fetchImpl, memory: options.memory ?? workerMemory });
+  const contentType = request.headers.get("content-type") ?? "";
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    const params = new URLSearchParams(body);
+    const userId = params.get("user_id") ?? "";
+    const responseUrl = params.get("response_url") ?? "";
+    const channelId = params.get("channel_id") ?? "";
+    ctx.waitUntil(assistant.answer(
+      `slash:${params.get("trigger_id") ?? timestamp}`,
+      userId,
+      `slash:${userId}:${channelId}`,
+      params.get("text") ?? "",
+      (text) => responseUrl
+        ? postSlackResponseUrl(fetchImpl, responseUrl, text)
+        : postSlackMessage(fetchImpl, config.slackBotToken, channelId, "", text),
+    ).catch((error: unknown) => {
+      console.error(safeError(error));
+    }));
+    return new Response("", { status: 200 });
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body) as unknown;
+  } catch {
+    return new Response("Expected JSON.", { status: 400 });
+  }
+  if (!isRecord(payload)) return new Response("Expected JSON.", { status: 400 });
+  if (payload.type === "url_verification" && typeof payload.challenge === "string") {
+    return Response.json({ challenge: payload.challenge });
+  }
+  if (payload.type !== "event_callback" || !isRecord(payload.event)) {
+    return new Response("", { status: 200 });
+  }
+  const event = payload.event;
+  if (typeof event.user !== "string" || typeof event.text !== "string" || typeof event.ts !== "string" || typeof event.channel !== "string") {
+    return new Response("", { status: 200 });
+  }
+  if (event.subtype || event.bot_id) return new Response("", { status: 200 });
+  const isMention = event.type === "app_mention";
+  const isDirectMessage = event.type === "message" && event.channel_type === "im";
+  if (!isMention && !isDirectMessage) return new Response("", { status: 200 });
+  const threadTs = typeof event.thread_ts === "string" ? event.thread_ts : event.ts;
+  const eventId = typeof payload.event_id === "string" ? payload.event_id : `${event.channel}:${event.ts}`;
+  ctx.waitUntil(assistant.answer(
+    eventId,
+    event.user,
+    `${event.channel}:${threadTs}`,
+    event.text,
+    (text) => postSlackMessage(fetchImpl, config.slackBotToken, event.channel as string, threadTs, text),
+  ).catch((error: unknown) => {
+    console.error(safeError(error));
+  }));
+  return new Response("", { status: 200 });
+}
+
+export default {
+  async fetch(request: Request, env: Record<string, unknown>, ctx: WorkerExecutionContext): Promise<Response> {
+    return handleWorkerRequest(request, env, ctx);
+  },
+};
 
 function loadDotEnv(filePath: string): void {
   if (!existsSync(filePath)) return;
