@@ -1,59 +1,57 @@
 # Syncron Jr
 
-BDK Slack assistant for MSP technicians, service managers, and owners. Ask in Slack; the agent reads Syncro (read-only), ranks attention in code, and answers from tool evidence.
+MSP Slack assistant for technicians, service managers, and owners. Reads Syncro (read-only), ranks attention in code, and answers from tool evidence.
 
-## What it can answer
+Two runtimes share the same Syncro logic:
 
-- Overdue and at-risk tickets, with a stable attention order
-- Ticket detail, recent comments, linked assets, and timer notes
-- Customer lookup without sending email, phone, or street address to the model
-- Open-ticket counts, aging, recurring problem types, and assignee queue size
-- Troubleshooting or escalation suggestions grounded in retrieved tickets
+| Runtime | Use |
+| --- | --- |
+| Cloudflare Worker (`app.ts`) | Production Slack HTTP events |
+| BDK (`bot/`) | Local Socket Mode / playground |
 
-Follow-ups stay in the Slack thread. Mention the bot or DM it.
+## Cloudflare Worker (Slack)
 
-## Develop
+Deployed at `https://syncron-jr.notifications-812.workers.dev`.
+
+Slack app **Syncron Jr** on `a7-slacker-sandbox` posts events to `/slack/events`. Mention `@Syncron Jr`, DM it, or use `/msp`.
+
+```bash
+npm install
+npx wrangler login
+npm run deploy:worker
+npx wrangler secret put SLACK_BOT_TOKEN
+npx wrangler secret put SLACK_SIGNING_SECRET
+npx wrangler secret put SYNCRO_BASE_URL
+npx wrangler secret put SYNCRO_API_KEY
+npx wrangler secret put LLM_PROVIDER
+npx wrangler secret put LLM_API_KEY
+```
+
+`GET /health` returns `{ "ok": true }`.
+
+## BDK (local)
 
 ```bash
 npm install
 cp .env.example .env.local
-# Mint Slack tokens (writes SYNCRON_JR_SLACK_* into .env.local):
-npx bdk slack create --dir . --name "Syncron Jr"
+# SYNCRON_JR_SLACK_* from Slack CLI / doctor
 npx bdk validate --dir .
 npx bdk dev
 ```
 
-| Command | Purpose |
-| --- | --- |
-| `npm run dev` | Serve locally with playground |
-| `npm test` | Mocked Syncro unit tests |
-| `npm run check` | Typecheck |
-| `npx bdk validate --dir .` | Validate agent surface |
-| `npx bdk slack doctor --prefix SYNCRON_JR` | Check Slack tokens |
-
 ## Configure
 
-Required secrets:
+| Secret | Purpose |
+| --- | --- |
+| `SYNCRO_BASE_URL` | e.g. `https://your-subdomain.syncromsp.com` |
+| `SYNCRO_API_KEY` | Syncro API token (tickets/customers/assets read) |
+| `SLACK_BOT_TOKEN` | Worker HTTP Slack bot (`xoxb-`) |
+| `SLACK_SIGNING_SECRET` | Worker request verification |
+| `LLM_PROVIDER` / `LLM_API_KEY` | Worker model (`openai` or `openrouter`) |
+| `SYNCRON_JR_SLACK_BOT_TOKEN` / `SYNCRON_JR_SLACK_APP_TOKEN` | BDK Socket Mode only |
 
-- `SYNCRO_BASE_URL` such as `https://your-subdomain.syncromsp.com`
-- `SYNCRO_API_KEY`
+Optional: `SLACK_ALLOWED_USER_IDS`, `SLA_DUE_SOON_HOURS`, `SYNCRO_MAX_PAGES`.
 
-Slack tokens come from `bdk slack create` (`SYNCRON_JR_SLACK_BOT_TOKEN`, `SYNCRON_JR_SLACK_APP_TOKEN`).
+## Behavior
 
-Optional:
-
-- `SLACK_ALLOWED_USER_IDS` — comma-separated Slack user IDs; empty allows the workspace
-- `SLA_DUE_SOON_HOURS` (default 24)
-- `SYNCRO_MAX_PAGES` (default 4)
-- `SYNCRO_TIMEOUT_MS` (default 20000)
-
-## Deploy
-
-```bash
-git push
-npx bdk deploy --dir .
-npx bdk secrets set syncron-jr SYNCRO_BASE_URL
-npx bdk secrets set syncron-jr SYNCRO_API_KEY
-```
-
-Use a Cursor service account for hosted deploy. Redeploy after setting secrets.
+Read-only. Drafts notes/replies but does not update Syncro or send mail. Ticket text is untrusted.

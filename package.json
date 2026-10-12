@@ -3,24 +3,29 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "BDK Slack assistant for MSP technicians, grounded in read-only Syncro data.",
+  "description": "MSP Slack assistant (BDK locally; Cloudflare Worker for Slack HTTP).",
   "engines": {
     "node": ">=22.13"
   },
   "scripts": {
     "check": "tsc --noEmit",
     "dev": "bdk dev",
+    "dev:worker": "tsx app.ts",
+    "deploy:worker": "wrangler deploy",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "validate": "bdk validate --dir ."
   },
   "dependencies": {
     "@cursor/bdk": "^0.2.23",
+    "@slack/bolt": "^4.4.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
+    "tsx": "^4.20.5",
     "typescript": "~5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "wrangler": "^4.149.0"
   }
 }
