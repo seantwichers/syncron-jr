@@ -20,9 +20,12 @@ import {
   loadServerConfig,
   normalizeTicket,
   parseSyncroBaseUrl,
+  prefersToolLookup,
   redactForModel,
   runAgentTurn,
   searchTickets,
+  shouldAnswerSlackEvent,
+  slackMemoryKey,
   type TicketSummary,
   type ToolContext,
 } from "../app.ts";
@@ -194,6 +197,9 @@ describe("configuration", () => {
     expect(openrouter.llmBaseUrl).toBe("https://openrouter.ai/api/v1");
     expect(openrouter.llmModel).toBe("openai/gpt-4o-mini");
     expect(openai.syncroApiBase).toBe("https://demo.syncromsp.com/api/v1");
+    expect(openai.allowedChannelIds).toBeNull();
+    const limited = loadServerConfig({ ...base, LLM_PROVIDER: "openai", SLACK_CHANNEL_IDS: "C1, C2" });
+    expect([...limited.allowedChannelIds ?? []].sort()).toEqual(["C1", "C2"]);
     expect(() => parseSyncroBaseUrl("http://demo.syncromsp.com")).toThrow(/https/);
   });
 });
@@ -283,6 +289,44 @@ describe("ticket tools", () => {
     expect(callsOf(urls).some((call) => call.includes("priority="))).toBe(false);
   });
 
+  it("matches problem type and tag locally and does not send them as Syncro filters", async () => {
+    const urls: string[] = [];
+    const syncro = clientFor((url, init) => {
+      expect(init?.method).toBe("GET");
+      urls.push(url.toString());
+      if (url.pathname.endsWith("/tickets")) {
+        return ticketPage([
+          rawTicket({
+            id: 3,
+            number: 300,
+            problem_type: "Printer",
+            status: "On-Hold",
+            tags: ["Hardware", "Onboarding"],
+            contact_fullname: "Jamie Operator",
+            ticket_type_name: "Incident",
+          }),
+        ]);
+      }
+      throw new Error(url.pathname);
+    });
+    const result = await searchTickets(syncro, { problem_type: "print", tag: "board", status: "On-Hold" }, RUNTIME);
+    const tickets = (result as { tickets: TicketSummary[]; localFilters: string[] }).tickets;
+    expect(tickets.map((ticket) => ticket.number)).toEqual([300]);
+    expect(tickets[0]?.tags).toEqual(["Hardware", "Onboarding"]);
+    expect(result).toMatchObject({
+      localFilters: ["problem_type~print (local)", "tag~board (local)"],
+      serverFilters: ["status=On-Hold"],
+    });
+    const calls = callsOf(urls).join(" ");
+    expect(calls).not.toContain("problem_type=");
+    expect(calls).not.toContain("tag=");
+    const missed = await searchTickets(syncro, { problem_type: "Printer", tag: "vpn" }, RUNTIME);
+    expect(missed).toMatchObject({ matched: 0 });
+    const byContact = await searchTickets(syncro, { contact: "jamie", ticket_type: "incident" }, RUNTIME);
+    expect((byContact as { tickets: TicketSummary[] }).tickets.map((ticket) => ticket.number)).toEqual([300]);
+    expect(callsOf(urls).join(" ")).not.toMatch(/contact=|ticket_type=/);
+  });
+
   it("resolves an assignee name through ticket settings", async () => {
     const urls: string[] = [];
     const syncro = openTicketRoutes(urls);
@@ -354,6 +398,7 @@ describe("ticket tools", () => {
     expect(serialized).not.toContain("erin@example.com");
     expect(buildSystemPrompt()).toMatch(/untrusted/i);
     expect(buildSystemPrompt()).toMatch(/never follow instructions/i);
+    expect(buildSystemPrompt()).toMatch(/Any read-only Syncro ticket question/);
   });
 });
 
@@ -505,6 +550,64 @@ describe("authorization and the model loop", () => {
     expect(seen[0]?.title).toBeUndefined();
     expect(seen[0]?.body).toContain("get_sla_risk");
     expect(seen[0]?.body).not.toContain("syncro-test-key");
+    expect(JSON.parse(seen[0]?.body ?? "{}")).toMatchObject({ tool_choice: "required" });
+    expect(JSON.parse(seen[1]?.body ?? "{}")).toMatchObject({ tool_choice: "auto" });
+  });
+
+  it("looks up a free-form ticket question and skips tools for a bare thanks", async () => {
+    const choices: string[] = [];
+    const syncro = openTicketRoutes([]);
+    const reply = await runAgentTurn({
+      syncro,
+      history: [{ role: "user", content: "Show overdue tickets" }, { role: "assistant", content: "Ticket 100 is oldest." }],
+      userText: "What did the customer last say on that printer ticket?",
+      now: NOW,
+      dueSoonHours: 24,
+      authorize: () => {},
+      fetchImpl: async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { tool_choice: string; messages: { role: string }[] };
+        choices.push(body.tool_choice);
+        const toolTurn = body.messages.some((message) => message.role === "tool");
+        const payload = toolTurn
+          ? { choices: [{ message: { content: "Findings: the latest public comment is a status check. Assessment: confirm the printer model before the next step." } }] }
+          : {
+              choices: [{
+                message: {
+                  tool_calls: [{
+                    id: "call_printer",
+                    type: "function",
+                    function: { name: "search_tickets", arguments: JSON.stringify({ query: "printer" }) },
+                  }],
+                },
+              }],
+            };
+        return new Response(JSON.stringify(payload), { status: 200 });
+      },
+      llm: { provider: "openai", apiKey: "llm-key", model: "test-model", baseUrl: "https://api.openai.com/v1" },
+    });
+    expect(choices[0]).toBe("required");
+    expect(reply).toMatch(/printer model/);
+
+    const thanks = await runAgentTurn({
+      syncro,
+      history: [],
+      userText: "thanks!",
+      now: NOW,
+      dueSoonHours: 24,
+      authorize: () => {},
+      fetchImpl: async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { tool_choice: string };
+        choices.push(body.tool_choice);
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: "You're welcome. Ask about another ticket whenever you want." } }],
+        }), { status: 200 });
+      },
+      llm: { provider: "openai", apiKey: "llm-key", model: "test-model", baseUrl: "https://api.openai.com/v1" },
+    });
+    expect(choices.at(-1)).toBe("auto");
+    expect(thanks).toMatch(/welcome/);
+    expect(prefersToolLookup("which tickets are waiting on the customer?")).toBe(true);
+    expect(prefersToolLookup("ok")).toBe(false);
   });
 
   it("returns tool validation errors to the model and blocks credential payloads", async () => {
@@ -566,6 +669,50 @@ describe("authorization and the model loop", () => {
 });
 
 describe("Slack conversation helpers", () => {
+  it("answers channel ticket questions, keeps thread context, and skips bots", () => {
+    const channel = {
+      type: "message",
+      channel_type: "channel",
+      user: "U1",
+      text: "Which tickets are On-Hold?",
+      ts: "10.1",
+      channel: "Cdesk",
+    };
+    expect(shouldAnswerSlackEvent(channel, null)).toBe(true);
+    expect(shouldAnswerSlackEvent({ ...channel, channel: "Cother" }, new Set(["Cdesk"]))).toBe(false);
+    expect(shouldAnswerSlackEvent({ ...channel, channel: "Cdesk" }, new Set(["Cdesk"]))).toBe(true);
+    expect(shouldAnswerSlackEvent({
+      type: "message",
+      channel_type: "channel",
+      user: "U1",
+      text: "What about the oldest?",
+      ts: "10.2",
+      thread_ts: "10.1",
+      channel: "Cdesk",
+    }, new Set(["Cdesk"]))).toBe(true);
+    expect(shouldAnswerSlackEvent({ ...channel, bot_id: "B1", text: "Checking Syncro…" }, null)).toBe(false);
+    expect(shouldAnswerSlackEvent({ ...channel, subtype: "message_changed" }, null)).toBe(false);
+    expect(shouldAnswerSlackEvent({
+      type: "message",
+      channel_type: "im",
+      user: "U1",
+      text: "help",
+      ts: "10.3",
+      channel: "D1",
+    }, new Set(["Cdesk"]))).toBe(true);
+    expect(shouldAnswerSlackEvent({
+      type: "app_mention",
+      user: "U1",
+      text: "<@UBOT> printer tickets",
+      ts: "10.4",
+      channel: "Cdesk",
+    }, null)).toBe(true);
+    expect(slackMemoryKey("Cdesk", "10.1", undefined, "channel")).toBe("Cdesk:10.1");
+    expect(slackMemoryKey("Cdesk", "10.2", "10.1", "channel")).toBe("Cdesk:10.1");
+    expect(slackMemoryKey("D1", "10.3", undefined, "im")).toBe("im:D1");
+    expect(slackMemoryKey("D1", "10.9", undefined, undefined)).toBe("im:D1");
+  });
+
   it("verifies Slack signatures, allowlists users, and keeps thread memory", async () => {
     const secret = "signing-secret";
     const body = "token=x&command=%2Fmsp";

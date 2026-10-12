@@ -10,9 +10,9 @@ The application logic is in `app.ts`. It does not write to Syncro.
 - Ticket detail, recent comments, linked assets, and timer notes.
 - Customer lookup without sending email, phone, or street address to the model.
 - Open-ticket counts, aging, recurring problem types, and assignee queue size.
-- A troubleshooting or escalation suggestion grounded in the retrieved ticket.
+- Any other read-only ticket question: status, history, customer, assignee, age, problem type, tags, assets, or a drafted next step.
 
-Follow-up questions stay in the Slack thread. Mention the bot, send it a direct message, or use `/msp`.
+Invite the bot to a channel and it answers every human message there, including follow-ups in the thread it opens. You do not need to @mention it again. Direct messages and `/msp` still work. Set `SLACK_CHANNEL_IDS` when the bot should stay quiet in other channels.
 
 ## Run
 
@@ -52,6 +52,8 @@ Set `SLACK_APP_TOKEN` (`xapp-`, scope `connections:write`) to use Socket Mode. L
 
 `SLACK_ALLOWED_USER_IDS` is an optional comma-separated list of Slack user IDs. Empty means any user in the workspace can ask. That list is not role-based authorization. One process serves one Syncro account; run another process with its own environment for another organization.
 
+`SLACK_CHANNEL_IDS` is an optional comma-separated list of channel IDs. Empty means the bot answers every channel, private channel, and group DM it is in. Direct messages are always answered. Use this when the bot is invited somewhere it should not chat.
+
 `SLA_DUE_SOON_HOURS` (default 24) is the local rule for “due soon.” Syncro’s own `sla_breached` and `sla_breaching_soon` fields are reported when the ticket list returns them. Overdue means `due_date` is in the past and `resolved_at` is empty.
 
 The Syncro token needs read access to tickets, customers, and assets. This app calls only:
@@ -63,7 +65,7 @@ The Syncro token needs read access to tickets, customers, and assets. This app c
 - `GET /customers` and `GET /customers/{id}`
 - `GET /customer_assets`
 
-Priority, age, overdue, assignment gaps, and attention order are calculated locally. Those are not documented list filters. Page size is whatever Syncro returns, and each tool stops after `SYNCRO_MAX_PAGES` (default 4).
+Priority, age, overdue, assignment gaps, problem type, tag, contact, ticket type, and attention order are calculated locally. Those are not documented list filters. Page size is whatever Syncro returns, and each tool stops after `SYNCRO_MAX_PAGES` (default 4). Ticket questions call a Syncro tool before the model states a fact. Short greetings and thanks do not.
 
 ## Slack app
 
@@ -72,13 +74,18 @@ Create a Slack app and install it to the workspace.
 Bot scopes:
 
 - `app_mentions:read`
+- `channels:history`
 - `chat:write`
 - `commands`
+- `groups:history`
 - `im:history`
 - `im:read`
 - `im:write`
+- `mpim:history`
 
-Bot events: `app_mention`, `message.im`.
+Bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`, and `message.mpim`.
+
+`message.channels` and `message.groups` are what make a dedicated channel a conversation. Without them, Slack only delivers @mentions. The bot replies in a thread. A later reply in that thread uses the same conversation, so “what about the oldest?” stays grounded in the tickets just retrieved. @mentions and channel messages for the same Slack timestamp are answered once.
 
 Slash command: `/msp`.
 
@@ -113,7 +120,7 @@ Ticket text is treated as untrusted. Instructions found in a ticket cannot chang
 
 ## Checks
 
-The mocked suite covers pagination, local overdue filtering, attention order, redaction, allowlisting, Slack signature verification, and the shared OpenAI/OpenRouter tool loop.
+The mocked suite covers pagination, local overdue, problem-type, and tag filtering, attention order, redaction, allowlisting, channel routing, Slack signature verification, and the shared OpenAI/OpenRouter tool loop.
 
 A live read against one Syncro account scanned 40 open tickets, calculated 26 overdue from `due_date`, and loaded the oldest open ticket (`#28641`) with its comment history. Syncro returned `sla_breached: false` on that set, and priority was unset, so the attention order came from due date and `customer_reply` rather than a breach flag or priority label.
 
