@@ -273,7 +273,43 @@ describe("batchSyncroRead", () => {
 });
 
 describe("summarizeOpenTickets", () => {
-  it("returns history digests for more than 10 open tickets", async () => {
+  it("returns a brief rundown covering every open ticket by default", async () => {
+    const many = Array.from({ length: 34 }, (_, index) =>
+      rawTicket({
+        id: index + 1,
+        number: 1000 + index,
+        subject: `Issue ${index + 1}`,
+        customer_business_then_name: `Customer ${index + 1}`,
+      }),
+    );
+    const syncro = mockSyncro({
+      "/tickets": () => ({
+        tickets: many,
+        meta: { total_pages: 1, total_entries: many.length, per_page: 50 },
+      }),
+    });
+    const result = (await summarizeOpenTickets(syncro, {}, RUNTIME)) as {
+      mode: string;
+      returned: number;
+      rosterCount: number;
+      openTicketCount: number;
+      includeHistory: boolean;
+      roster: Array<{ number: number | null }>;
+      tickets: Array<{ number: number | null; whatHappened?: string }>;
+      replyInstruction: string;
+    };
+    expect(result.mode).toBe("open_ticket_brief_rundown");
+    expect(result.includeHistory).toBe(false);
+    expect(result.openTicketCount).toBe(34);
+    expect(result.rosterCount).toBe(34);
+    expect(result.returned).toBe(34);
+    expect(result.roster).toHaveLength(34);
+    expect(result.tickets).toHaveLength(34);
+    expect(result.tickets[0]?.whatHappened).toBeUndefined();
+    expect(result.replyInstruction).toMatch(/Bullet count MUST equal rosterCount/);
+  });
+
+  it("returns history digests when include_history is true", async () => {
     const many = Array.from({ length: 12 }, (_, index) =>
       rawTicket({
         id: index + 1,
@@ -318,11 +354,18 @@ describe("summarizeOpenTickets", () => {
         ]),
       ),
     });
-    const result = (await summarizeOpenTickets(syncro, { max_tickets: 50 }, RUNTIME)) as {
+    const result = (await summarizeOpenTickets(syncro, {
+      max_tickets: 50,
+      include_history: true,
+    }, RUNTIME)) as {
       returned: number;
+      rosterCount: number;
       tickets: Array<{ number: number | null; whatHappened: string }>;
+      roster: unknown[];
     };
     expect(result.returned).toBe(12);
+    expect(result.rosterCount).toBe(12);
+    expect(result.roster).toHaveLength(12);
     expect(result.tickets).toHaveLength(12);
     expect(result.tickets[0]?.whatHappened).toMatch(/Started work|Waiting on parts/);
   });

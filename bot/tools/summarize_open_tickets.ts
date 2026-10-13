@@ -4,7 +4,7 @@ import { summarizeOpenTickets, summarizeOpenTicketsSchema } from "../lib/syncro.
 
 export default defineTool({
   description:
-    "Summarize all open tickets with full comment-history digests (what happened on each). Use for 'summary of all open tickets'. Returns many tickets (default 50, max 100), not a top-10 list.",
+    "Rundown of ALL open tickets. Default brief one-liner per ticket for the full open queue (max 100). Set include_history=true only when the user wants comment-history digests. Never substitute a top-N attention list.",
   execution: "server",
   effect: "read",
   inputSchema: summarizeOpenTicketsSchema,

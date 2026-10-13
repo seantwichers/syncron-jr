@@ -1,7 +1,14 @@
 /**
  * System prompt for Syncron Jr — MSP intelligence / director assistant.
  */
-export function buildSystemPrompt(): string {
+
+import {
+  DEFAULT_CONVERSATION_MODE,
+  buildModePrompt,
+  type ConversationMode,
+} from "./conversation-mode.js";
+
+export function buildSystemPrompt(mode: ConversationMode = DEFAULT_CONVERSATION_MODE): string {
   return [
     "You are Syncron Jr, an evidence-based MSP intelligence agent and virtual Director of IT.",
     "You help directors understand recurring technical problems, customer health, technician workload, service risks, and improvement opportunities across SyncroMSP history.",
@@ -30,7 +37,8 @@ export function buildSystemPrompt(): string {
     "| Question | Tool |",
     "| Top recurring problems / what should we fix first | investigate_recurring_problems |",
     "| Trends vs prior period (volume, backlog, labor, SLA) | analyze_operational_trends |",
-    "| Summary of all open tickets with histories | summarize_open_tickets |",
+    "| Brief rundown / list of ALL open tickets | summarize_open_tickets (include_history=false, default) |",
+    "| What happened on each open ticket | summarize_open_tickets (include_history=true) |",
     "| Queue concentration / portfolio rollup | digest_open_portfolio |",
     "| Multi-API gather | batch_syncro_read / run_research_plan |",
     "| Morning brief | get_operations_brief |",
@@ -40,5 +48,7 @@ export function buildSystemPrompt(): string {
     "",
     "When coverage.truncated or labor.recordedHours is null, say the analysis is incomplete — do not fill gaps with guesses.",
     "Relationship confidence from tools: confirmed > probable > weak. Do not upgrade weak keyword overlap into a common root cause.",
+    "",
+    buildModePrompt(mode),
   ].join("\n");
 }

@@ -12,11 +12,23 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { App } from "@slack/bolt";
 import { z } from "zod";
 import {
+  modeSwitchAck,
+  parseModeSwitch,
+  type ConversationMode,
+} from "./bot/lib/conversation-mode.js";
+import {
   ConversationMemory,
   kvBackendFromBinding,
   slackMemoryKey,
   type StoredMessage,
 } from "./bot/lib/conversation-memory.js";
+import {
+  WORKER_BUILD,
+  ensureCompleteOpenTicketRundown,
+  formatOpenTicketRundown,
+  isOpenTicketRundownRequest,
+  wantsOpenTicketHistory,
+} from "./bot/lib/open-ticket-rundown.js";
 import { buildSystemPrompt } from "./bot/lib/system-prompt.js";
 import {
   assetDetailsSchema,
@@ -83,10 +95,12 @@ const ATTENTION_ORDER = [
 
 const HELP_TEXT = [
   "I'm Syncron Jr — an MSP intelligence agent for directors and service managers.",
+  "Default is *conversation mode*: I synthesize patterns, risks, and actions — I don't restate Syncro screens.",
+  "Say *lookup mode* for short factual lists, or *conversation mode* to switch back.",
   "Examples:",
   "• Analyze the last 90 days: top recurring technical problems and what to fix first.",
   "• Compare this month's ticket/labor trends to the prior period.",
-  "• Summarize all open tickets with what happened on each.",
+  "• What's the real risk in our open queue right now?",
   "Read-only Syncro. I cite evidence and say when data is incomplete.",
 ].join("\n");
 
@@ -182,6 +196,63 @@ function clip(input: string, max: number): string {
 function capJson(text: string, max: number): string {
   if (text.length <= max) return text;
   return JSON.stringify({ truncated: true, preview: text.slice(0, Math.max(0, max - 80)) });
+}
+
+/**
+ * Serialize tool results for the model. Prefer keeping complete ticket rosters
+ * when payloads are large — never collapse a 34-ticket queue into a 2-ticket preview.
+ */
+function serializeToolResult(result: unknown, max: number): string {
+  const redacted = redactForModel(JSON.stringify(result));
+  if (redacted.length <= max) return redacted;
+  if (!isRecord(result)) return capJson(redacted, max);
+
+  const roster = Array.isArray(result.roster)
+    ? result.roster
+    : Array.isArray(result.tickets)
+      ? result.tickets
+      : null;
+
+  if (roster && roster.length > 0) {
+    const compactRoster = roster.map((row) => {
+      if (!isRecord(row)) return row;
+      return {
+        number: row.number ?? null,
+        id: row.id ?? null,
+        subject: typeof row.subject === "string" ? row.subject.slice(0, 120) : row.subject ?? null,
+        status: row.status ?? null,
+        customerName: row.customerName ?? null,
+        assigneeName: row.assigneeName ?? null,
+        ageDays: row.ageDays ?? null,
+        overdue: row.overdue ?? null,
+        url: row.url ?? null,
+        attention: Array.isArray(row.attention)
+          ? row.attention.slice(0, 2)
+          : Array.isArray(row.attentionReasons)
+            ? row.attentionReasons.slice(0, 2)
+            : undefined,
+      };
+    });
+    const compacted: Record<string, unknown> = {
+      truncatedForModel: true,
+      mode: result.mode,
+      headline: result.headline,
+      openTicketCount: result.openTicketCount ?? compactRoster.length,
+      rosterCount: compactRoster.length,
+      returned: compactRoster.length,
+      omitted: result.omitted ?? 0,
+      portfolio: result.portfolio,
+      roster: compactRoster,
+      tickets: compactRoster,
+      replyInstruction: result.replyInstruction
+        ?? "Cover EVERY roster row. Bullet count must equal rosterCount.",
+      note: "Full tool payload was large; compact roster retained so every open ticket remains visible.",
+    };
+    const compactedJson = redactForModel(JSON.stringify(compacted));
+    if (compactedJson.length <= max) return compactedJson;
+  }
+
+  return capJson(redacted, max);
 }
 
 function plainText(input: string): string {
@@ -1739,15 +1810,15 @@ const TOOLS: ToolDefinition[] = [
   },
   {
     name: "summarize_open_tickets",
-    description: "Summarize ALL open tickets with full comment history digests (what happened on each ticket). Use when the user asks for a summary of open tickets, everything that happened, or a portfolio walkthrough. Returns many tickets (default 50, up to 100), not a top-10 list.",
+    description: "Rundown of ALL open tickets (status=Not Closed). Default is a brief one-liner per ticket covering the full open queue (default max 100). Set include_history=true only when the user wants comment-history digests / what happened on each ticket. Never use a top-2/top-10 attention tool for 'all open tickets'.",
     parameters: objectSchema({
       created_after: { type: "string" },
       customer_id: { type: "integer" },
       user_id: { type: "integer" },
       max_pages: { type: "integer" },
-      max_tickets: { type: "integer", description: "How many open tickets to history-digest (1-100, default 50)." },
+      max_tickets: { type: "integer", description: "How many open tickets to include (1-100, default 100)." },
       sort: { type: "string", enum: ["attention", "oldest", "newest", "most_overdue", "updated"] },
-      include_history: { type: "boolean" },
+      include_history: { type: "boolean", description: "Default false for brief rundowns. True only for full history digests." },
     }),
     schema: summarizeOpenTicketsSchema,
     run: (args, syncro, runtime) => summarizeOpenTickets(syncro, summarizeOpenTicketsSchema.parse(args), runtime),
@@ -1820,6 +1891,8 @@ export interface RunAgentInput {
   history: StoredMessage[];
   /** Rolling director briefing from prior turns in this conversation. */
   conversationBriefing?: string;
+  /** Reply style: intelligence (default) synthesizes; lookup stays factual. */
+  conversationMode?: ConversationMode;
   userText: string;
   now?: Date;
   dueSoonHours: number;
@@ -1919,9 +1992,10 @@ function toSlackMrkdwn(text: string): string {
 }
 
 async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolChoice: "auto" | "none"): Promise<ChatMessage> {
+  const temperature = input.conversationMode === "lookup" ? 0.1 : 0.25;
   const payload = {
     model: input.llm.model,
-    temperature: 0.15,
+    temperature,
     max_tokens: 8000,
     messages,
     tools: TOOLS.map((tool) => ({
@@ -1997,6 +2071,25 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   input.authorize();
   const now = input.now ?? new Date();
   const deadline = input.deadlineMs ?? Date.now() + TURN_BUDGET_MS;
+  const mode = input.conversationMode ?? "intelligence";
+  const userText = truncate(redactSecrets(input.userText), 2000);
+
+  // Deterministic path: "all open tickets" rundowns must list every ticket.
+  // The model repeatedly under-covers large queues (e.g. 2 of 34).
+  if (isOpenTicketRundownRequest(userText)) {
+    const result = await summarizeOpenTickets(
+      input.syncro,
+      {
+        include_history: wantsOpenTicketHistory(userText),
+        max_tickets: 100,
+        sort: "attention",
+      },
+      { now, dueSoonHours: input.dueSoonHours },
+    );
+    const formatted = formatOpenTicketRundown(result);
+    if (formatted) return toSlackMrkdwn(formatted);
+  }
+
   const briefing = input.conversationBriefing?.trim();
   const memoryBlock = briefing
     ? [
@@ -2006,12 +2099,12 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
       ].join("\n")
     : "Conversation memory: no prior briefing for this chat yet.";
   const messages: ChatMessage[] = [
-    { role: "system", content: buildSystemPrompt() },
+    { role: "system", content: buildSystemPrompt(mode) },
     { role: "system", content: memoryBlock },
     ...input.history.map((message) => ({ role: message.role, content: message.content })),
     {
       role: "user",
-      content: `Request time: ${now.toISOString()}\n${truncate(redactSecrets(input.userText), 2000)}`,
+      content: `Request time: ${now.toISOString()}\n${userText}`,
     },
   ];
   const toolResults: unknown[] = [];
@@ -2021,6 +2114,15 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     dueSoonHours: input.dueSoonHours,
     authorize: input.authorize,
   };
+  const toolJsonCap = mode === "intelligence" ? 100_000 : 120_000;
+  const finalizeReply = (reply: string): string =>
+    toSlackMrkdwn(
+      ensureCompleteOpenTicketRundown(
+        withTicketLinks(redactForModel(reply), toolResults),
+        toolResults,
+        userText,
+      ),
+    );
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
     if (Date.now() > deadline) {
       throw new AppError("That request took too long. Try a narrower question.", "turn_timeout", true);
@@ -2030,7 +2132,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     if (!assistant.tool_calls?.length) {
       const reply = assistant.content?.trim();
       if (!reply) throw new AppError("The language model returned an empty answer.", "llm_empty", true);
-      return toSlackMrkdwn(withTicketLinks(redactForModel(reply), toolResults));
+      return finalizeReply(reply);
     }
     for (const call of assistant.tool_calls) {
       let parsed: unknown = {};
@@ -2044,18 +2146,26 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
         else result = { error: `Could not run ${call.function.name}.` };
       }
       toolResults.push(result);
-      const serialized = capJson(redactForModel(JSON.stringify(result)), 48_000);
+      const serialized = serializeToolResult(result, toolJsonCap);
       messages.push({ role: "tool", tool_call_id: call.id, content: serialized });
     }
   }
+  const stopInstruction = mode === "intelligence"
+    ? [
+        "Stop calling tools. Answer from the tool results already collected.",
+        "If roster[]/tickets[] from summarize_open_tickets is present, cover EVERY row — do not stop after a few examples.",
+        "Otherwise write a director briefing — executive finding, evidence anchors, interpretation, recommended action, confidence.",
+        "If evidence is insufficient, say what is missing.",
+      ].join(" ")
+    : "Stop calling tools. Answer from the tool results already collected. If they are insufficient, say what is missing.";
   messages.push({
     role: "user",
-    content: "Stop calling tools. Answer from the tool results already collected. If they are insufficient, say what is missing.",
+    content: stopInstruction,
   });
   const finalMessage = await completeChat(input, messages, "none");
   const reply = finalMessage.content?.trim();
   if (!reply) throw new AppError("The language model returned an empty answer.", "llm_empty", true);
-  return toSlackMrkdwn(withTicketLinks(redactForModel(reply), toolResults));
+  return finalizeReply(reply);
 }
 
 export interface HandleTextOptions {
@@ -2064,15 +2174,33 @@ export interface HandleTextOptions {
   text: string;
   memory: ConversationMemory;
   allowedUserIds: Set<string> | null;
-  respond: (history: StoredMessage[], text: string, briefing: string) => Promise<string>;
+  respond: (
+    history: StoredMessage[],
+    text: string,
+    briefing: string,
+    mode: ConversationMode,
+  ) => Promise<string>;
 }
 
 export async function handleUserText(options: HandleTextOptions): Promise<string> {
   if (!isUserAllowed(options.slackUserId, options.allowedUserIds)) throw new AuthorizationError();
   const text = truncate(options.text, 2000);
   if (!text || /^help$/i.test(text)) return HELP_TEXT;
+
+  const modeSwitch = parseModeSwitch(text);
+  if (modeSwitch) {
+    await options.memory.setMode(options.memoryKey, modeSwitch.mode);
+    if (modeSwitch.switchOnly) {
+      const ack = modeSwitchAck(modeSwitch.mode);
+      await options.memory.appendTurn(options.memoryKey, text, ack);
+      return ack;
+    }
+  }
+
   const state = await options.memory.load(options.memoryKey);
-  const reply = await options.respond(state.messages, text, state.briefing);
+  const mode = modeSwitch?.mode ?? state.mode;
+  const question = modeSwitch?.remainder ?? text;
+  const reply = await options.respond(state.messages, question, state.briefing, mode);
   await options.memory.appendTurn(options.memoryKey, text, reply);
   return reply;
 }
@@ -2173,12 +2301,19 @@ function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
   const secrets = [config.syncroApiKey, config.slackBotToken, config.slackSigningSecret, config.llmApiKey];
   if (config.slackAppToken) secrets.push(config.slackAppToken);
 
-  const respond = (slackUserId: string, history: StoredMessage[], text: string, briefing: string) =>
+  const respond = (
+    slackUserId: string,
+    history: StoredMessage[],
+    text: string,
+    briefing: string,
+    mode: ConversationMode,
+  ) =>
     budgetStore.run(new RequestBudget(MAX_REQUESTS_PER_TURN), () =>
       principalStore.run({ slackUserId }, () => runAgentTurn({
         syncro,
         history,
         conversationBriefing: briefing,
+        conversationMode: mode,
         userText: text,
         dueSoonHours: config.dueSoonHours,
         authorize: () => authorizeSlack(config.allowedUserIds),
@@ -2211,14 +2346,19 @@ function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
         await post(HELP_TEXT);
         return;
       }
-      await post("Checking Syncro…");
+      const pendingSwitch = parseModeSwitch(trimmed);
+      if (!pendingSwitch?.switchOnly) {
+        const activeMode = pendingSwitch?.mode ?? await memory.getMode(memoryKey);
+        await post(activeMode === "lookup" ? "Checking Syncro…" : "Thinking through the ops picture…");
+      }
       const reply = await handleUserText({
         memoryKey,
         slackUserId,
         text: trimmed,
         memory,
         allowedUserIds: config.allowedUserIds,
-        respond: (history, userText, briefing) => respond(slackUserId, history, userText, briefing),
+        respond: (history, userText, briefing, mode) =>
+          respond(slackUserId, history, userText, briefing, mode),
       });
       for (const chunk of chunkSlackText(reply)) await post(chunk);
     } catch (error) {
@@ -2404,7 +2544,11 @@ export async function handleWorkerRequest(
 ): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-    return Response.json({ ok: true, service: "msp-assistant" });
+    return Response.json({
+      ok: true,
+      service: "msp-assistant",
+      build: WORKER_BUILD,
+    });
   }
   if (request.method !== "POST") return new Response("Not found", { status: 404 });
 
