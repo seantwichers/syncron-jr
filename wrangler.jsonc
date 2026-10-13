@@ -8,5 +8,12 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SYNCRO_JR_MEMORY",
+      "id": "032e5ab2efd44f2da637eceacc4d8a23",
+      "preview_id": "da155ded996a43d998864288b9e7a843"
+    }
+  ]
 }

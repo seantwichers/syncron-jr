@@ -11,6 +11,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { App } from "@slack/bolt";
 import { z } from "zod";
+import {
+  ConversationMemory,
+  kvBackendFromBinding,
+  slackMemoryKey,
+  type StoredMessage,
+} from "./bot/lib/conversation-memory.js";
 import { buildSystemPrompt } from "./bot/lib/system-prompt.js";
 import {
   assetDetailsSchema,
@@ -38,10 +44,13 @@ import {
   syncroApiReadSchema,
 } from "./bot/lib/syncro.js";
 
+export type { StoredMessage };
+export { ConversationMemory, slackMemoryKey };
+
 const MAX_TOOL_ROUNDS = 12;
 const MAX_REQUESTS_PER_TURN = 48;
-const MAX_HISTORY_MESSAGES = 24;
-const MEMORY_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_HISTORY_MESSAGES = 40;
+const MEMORY_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const MODEL_TIMEOUT_MS = 75_000;
 const TURN_BUDGET_MS = 120_000;
 
@@ -63,11 +72,11 @@ const ATTENTION_ORDER = [
 ];
 
 const HELP_TEXT = [
-  "I'm your Director of IT view into Syncro — I digest large queues, chain multiple API reads, and answer big-picture questions.",
+  "I'm Syncron Jr — your Director of IT for Syncro. I keep our conversation in mind, give executive briefs, and drill into tickets when it matters.",
   "Examples:",
-  "• Digests the open portfolio: which customers concentrate risk?",
-  "• Pull tickets + invoices + appointments for our top accounts.",
-  "• Research plan: queue health, overloaded techs, and calendar for this week.",
+  "• Morning brief: where is risk concentrated?",
+  "• Follow up: dig into that Parker Hotel ticket we just discussed.",
+  "• Cross-cut: tickets + invoices + this week's appointments for our hottest accounts.",
   "Read-only: I cannot change Syncro or send messages.",
 ].join("\n");
 
@@ -1750,16 +1759,13 @@ interface ToolCall {
   function: { name: string; arguments: string };
 }
 
-export interface StoredMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
 export { buildSystemPrompt };
 
 export interface RunAgentInput {
   syncro: SyncroClient;
   history: StoredMessage[];
+  /** Rolling director briefing from prior turns in this conversation. */
+  conversationBriefing?: string;
   userText: string;
   now?: Date;
   dueSoonHours: number;
@@ -1861,8 +1867,8 @@ function toSlackMrkdwn(text: string): string {
 async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolChoice: "auto" | "none"): Promise<ChatMessage> {
   const payload = {
     model: input.llm.model,
-    temperature: 0.2,
-    max_tokens: 2800,
+    temperature: 0.15,
+    max_tokens: 1600,
     messages,
     tools: TOOLS.map((tool) => ({
       type: "function",
@@ -1937,8 +1943,17 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   input.authorize();
   const now = input.now ?? new Date();
   const deadline = input.deadlineMs ?? Date.now() + TURN_BUDGET_MS;
+  const briefing = input.conversationBriefing?.trim();
+  const memoryBlock = briefing
+    ? [
+        "Conversation memory (rolling briefing from earlier turns in this chat).",
+        "Use for continuity; verify with tools when facts may have changed.",
+        briefing,
+      ].join("\n")
+    : "Conversation memory: no prior briefing for this chat yet.";
   const messages: ChatMessage[] = [
     { role: "system", content: buildSystemPrompt() },
+    { role: "system", content: memoryBlock },
     ...input.history.map((message) => ({ role: message.role, content: message.content })),
     {
       role: "user",
@@ -1989,53 +2004,22 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   return toSlackMrkdwn(withTicketLinks(redactForModel(reply), toolResults));
 }
 
-export class ConversationMemory {
-  private readonly entries = new Map<string, { messages: StoredMessage[]; updatedAt: number }>();
-
-  constructor(
-    private readonly ttlMs = MEMORY_TTL_MS,
-    private readonly maxMessages = MAX_HISTORY_MESSAGES,
-    private readonly maxEntries = 100,
-  ) {}
-
-  get(key: string, now = Date.now()): StoredMessage[] {
-    const entry = this.entries.get(key);
-    if (!entry) return [];
-    if (now - entry.updatedAt > this.ttlMs) {
-      this.entries.delete(key);
-      return [];
-    }
-    return entry.messages.map((message) => ({ ...message }));
-  }
-
-  append(key: string, role: StoredMessage["role"], content: string, now = Date.now()): void {
-    const current = this.get(key, now);
-    current.push({ role, content: truncate(redactForModel(content), 4000) });
-    const messages = current.slice(-this.maxMessages);
-    this.entries.set(key, { messages, updatedAt: now });
-    if (this.entries.size <= this.maxEntries) return;
-    const oldest = [...this.entries.entries()].sort((left, right) => left[1].updatedAt - right[1].updatedAt)[0];
-    if (oldest && oldest[0] !== key) this.entries.delete(oldest[0]);
-  }
-}
-
 export interface HandleTextOptions {
   memoryKey: string;
   slackUserId: string;
   text: string;
   memory: ConversationMemory;
   allowedUserIds: Set<string> | null;
-  respond: (history: StoredMessage[], text: string) => Promise<string>;
+  respond: (history: StoredMessage[], text: string, briefing: string) => Promise<string>;
 }
 
 export async function handleUserText(options: HandleTextOptions): Promise<string> {
   if (!isUserAllowed(options.slackUserId, options.allowedUserIds)) throw new AuthorizationError();
   const text = truncate(options.text, 2000);
   if (!text || /^help$/i.test(text)) return HELP_TEXT;
-  const history = options.memory.get(options.memoryKey);
-  const reply = await options.respond(history, text);
-  options.memory.append(options.memoryKey, "user", text);
-  options.memory.append(options.memoryKey, "assistant", reply);
+  const state = await options.memory.load(options.memoryKey);
+  const reply = await options.respond(state.messages, text, state.briefing);
+  await options.memory.appendTurn(options.memoryKey, text, reply);
   return reply;
 }
 
@@ -2112,7 +2096,12 @@ interface AssistantOptions {
 }
 
 function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
-  const memory = options.memory ?? new ConversationMemory();
+  const memory = options.memory ?? new ConversationMemory({
+    ttlMs: MEMORY_TTL_MS,
+    maxMessages: MAX_HISTORY_MESSAGES,
+    redact: redactForModel,
+    truncate,
+  });
   const syncro = new SyncroClient({
     apiBase: config.syncroApiBase,
     webOrigin: config.syncroWebOrigin,
@@ -2130,11 +2119,12 @@ function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
   const secrets = [config.syncroApiKey, config.slackBotToken, config.slackSigningSecret, config.llmApiKey];
   if (config.slackAppToken) secrets.push(config.slackAppToken);
 
-  const respond = (slackUserId: string, history: StoredMessage[], text: string) =>
+  const respond = (slackUserId: string, history: StoredMessage[], text: string, briefing: string) =>
     budgetStore.run(new RequestBudget(MAX_REQUESTS_PER_TURN), () =>
       principalStore.run({ slackUserId }, () => runAgentTurn({
         syncro,
         history,
+        conversationBriefing: briefing,
         userText: text,
         dueSoonHours: config.dueSoonHours,
         authorize: () => authorizeSlack(config.allowedUserIds),
@@ -2174,7 +2164,7 @@ function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
         text: trimmed,
         memory,
         allowedUserIds: config.allowedUserIds,
-        respond: (history, userText) => respond(slackUserId, history, userText),
+        respond: (history, userText, briefing) => respond(slackUserId, history, userText, briefing),
       });
       for (const chunk of chunkSlackText(reply)) await post(chunk);
     } catch (error) {
@@ -2209,7 +2199,13 @@ async function startServer(): Promise<void> {
     await answer(
       `${event.channel}:${event.ts}`,
       event.user,
-      `${event.channel}:${threadTs}`,
+      slackMemoryKey({
+        channel: event.channel,
+        userId: event.user,
+        isDirectMessage: false,
+        threadTs: event.thread_ts,
+        messageTs: event.ts,
+      }),
       event.text ?? "",
       (text) => say({ text, thread_ts: threadTs }),
     );
@@ -2224,13 +2220,20 @@ async function startServer(): Promise<void> {
     if ("bot_id" in message && message.bot_id) return;
     const channelType = "channel_type" in message ? message.channel_type : undefined;
     if (channelType !== "im") return;
-    const threadTs = "thread_ts" in message && typeof message.thread_ts === "string" ? message.thread_ts : message.ts;
+    const inThread = "thread_ts" in message && typeof message.thread_ts === "string";
+    const replyThread = inThread ? message.thread_ts : undefined;
     await answer(
       `${message.channel}:${message.ts}`,
       message.user,
-      `${message.channel}:${threadTs}`,
+      slackMemoryKey({
+        channel: message.channel,
+        userId: message.user,
+        isDirectMessage: true,
+        threadTs: inThread ? message.thread_ts : null,
+        messageTs: message.ts,
+      }),
       message.text,
-      (text) => say({ text, thread_ts: threadTs }),
+      (text) => (replyThread ? say({ text, thread_ts: replyThread }) : say({ text })),
     );
   });
 
@@ -2239,7 +2242,13 @@ async function startServer(): Promise<void> {
     await answer(
       `slash:${command.trigger_id}`,
       command.user_id,
-      `slash:${command.user_id}:${command.channel_id}`,
+      slackMemoryKey({
+        channel: command.channel_id,
+        userId: command.user_id,
+        isDirectMessage: false,
+        messageTs: command.trigger_id,
+        kind: "slash",
+      }),
       command.text ?? "",
       (text) => slashRespond({ response_type: "ephemeral", text }),
     );
@@ -2258,7 +2267,15 @@ async function startServer(): Promise<void> {
   console.log(`Syncro ${config.syncroWebOrigin}. LLM ${config.llmProvider} / ${config.llmModel}.`);
 }
 
-const workerMemory = new ConversationMemory();
+function createWorkerMemory(bindings: Record<string, unknown>): ConversationMemory {
+  return new ConversationMemory({
+    ttlMs: MEMORY_TTL_MS,
+    maxMessages: MAX_HISTORY_MESSAGES,
+    backend: kvBackendFromBinding(bindings.SYNCRO_JR_MEMORY),
+    redact: redactForModel,
+    truncate,
+  });
+}
 
 interface WorkerExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
@@ -2353,7 +2370,10 @@ export async function handleWorkerRequest(
   }
 
   const fetchImpl = options.fetchImpl ?? boundFetch;
-  const assistant = createAssistant(config, { fetchImpl, memory: options.memory ?? workerMemory });
+  const assistant = createAssistant(config, {
+    fetchImpl,
+    memory: options.memory ?? createWorkerMemory(bindings),
+  });
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("application/x-www-form-urlencoded")) {
     const params = new URLSearchParams(body);
@@ -2363,7 +2383,13 @@ export async function handleWorkerRequest(
     ctx.waitUntil(assistant.answer(
       `slash:${params.get("trigger_id") ?? timestamp}`,
       userId,
-      `slash:${userId}:${channelId}`,
+      slackMemoryKey({
+        channel: channelId,
+        userId,
+        isDirectMessage: false,
+        messageTs: params.get("trigger_id") ?? timestamp,
+        kind: "slash",
+      }),
       params.get("text") ?? "",
       (text) => responseUrl
         ? postSlackResponseUrl(fetchImpl, responseUrl, text)
@@ -2395,14 +2421,24 @@ export async function handleWorkerRequest(
   const isMention = event.type === "app_mention";
   const isDirectMessage = event.type === "message" && event.channel_type === "im";
   if (!isMention && !isDirectMessage) return new Response("", { status: 200 });
-  const threadTs = typeof event.thread_ts === "string" ? event.thread_ts : event.ts;
+  const inThread = typeof event.thread_ts === "string";
+  const replyThreadTs = isDirectMessage
+    ? (inThread ? event.thread_ts as string : "")
+    : (inThread ? event.thread_ts as string : event.ts);
   const eventId = typeof payload.event_id === "string" ? payload.event_id : `${event.channel}:${event.ts}`;
+  const memoryKey = slackMemoryKey({
+    channel: event.channel,
+    userId: event.user,
+    isDirectMessage,
+    threadTs: inThread ? event.thread_ts as string : null,
+    messageTs: event.ts,
+  });
   ctx.waitUntil(assistant.answer(
     eventId,
     event.user,
-    `${event.channel}:${threadTs}`,
+    memoryKey,
     event.text,
-    (text) => postSlackMessage(fetchImpl, config.slackBotToken, event.channel as string, threadTs, text),
+    (text) => postSlackMessage(fetchImpl, config.slackBotToken, event.channel as string, replyThreadTs, text),
   ).catch((error: unknown) => {
     console.error(safeError(error));
   }));
