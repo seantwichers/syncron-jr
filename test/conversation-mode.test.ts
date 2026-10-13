@@ -56,7 +56,8 @@ describe("mode prompts", () => {
     expect(prompt).toMatch(/already reviewed Syncro/i);
     expect(prompt).toMatch(/Active mode: human/i);
     expect(buildModePrompt("human")).toMatch(/plain first-person/i);
-    expect(buildModePrompt("human")).toMatch(/No section labels like Executive finding/i);
+    expect(buildModePrompt("human")).toMatch(/No section labels/i);
+    expect(buildModePrompt("human")).toMatch(/Do NOT call Waiting on Customer/i);
   });
 
   it("keeps structured mode formal", () => {

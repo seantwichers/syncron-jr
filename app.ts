@@ -25,8 +25,12 @@ import {
 import {
   WORKER_BUILD,
   ensureCompleteOpenTicketRundown,
+  formatEasyActionableBrief,
   formatOpenTicketRundown,
+  formatOpenTicketSituationBrief,
+  isEasyActionableRequest,
   isOpenTicketRundownRequest,
+  isOpenTicketSituationRequest,
   wantsOpenTicketHistory,
 } from "./bot/lib/open-ticket-rundown.js";
 import { buildSystemPrompt } from "./bot/lib/system-prompt.js";
@@ -1861,6 +1865,10 @@ function collectTicketRefs(value: unknown, into: TicketSummary[]): void {
 }
 
 function withTicketLinks(reply: string, toolResults: unknown[]): string {
+  // Human answers already cite the tickets that matter — don't append a second inventory.
+  const alreadyCited = (reply.match(/#\d{3,}|\bid\s+\d+/gi) ?? []).length;
+  if (alreadyCited >= 3) return reply;
+
   const refs: TicketSummary[] = [];
   for (const result of toolResults) collectTicketRefs(result, refs);
   const lines: string[] = [];
@@ -1871,7 +1879,7 @@ function withTicketLinks(reply: string, toolResults: unknown[]): string {
     const label = ref.number ? `#${ref.number}` : `id ${ref.id}`;
     const assignee = ref.assigneeName ? `, ${ref.assigneeName}` : "";
     lines.push(`• <${ref.url}|${label}> ${ref.status}${assignee}`);
-    if (lines.length >= 40) break;
+    if (lines.length >= 8) break;
   }
   if (!lines.length) return reply;
   return `${reply}\n\n*Ticket links*\n${lines.join("\n")}`;
@@ -1965,11 +1973,12 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   input.authorize();
   const now = input.now ?? new Date();
   const deadline = input.deadlineMs ?? Date.now() + TURN_BUDGET_MS;
-  const mode = input.conversationMode ?? "intelligence";
+  const mode = input.conversationMode ?? "human";
   const userText = truncate(redactSecrets(input.userText), 2000);
 
+  const runtime = { now, dueSoonHours: input.dueSoonHours };
+
   // Deterministic path: "all open tickets" rundowns must list every ticket.
-  // The model repeatedly under-covers large queues (e.g. 2 of 34).
   if (isOpenTicketRundownRequest(userText)) {
     const result = await summarizeOpenTickets(
       input.syncro,
@@ -1978,9 +1987,31 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
         max_tickets: 100,
         sort: "attention",
       },
-      { now, dueSoonHours: input.dueSoonHours },
+      runtime,
     );
     const formatted = formatOpenTicketRundown(result);
+    if (formatted) return toSlackMrkdwn(formatted);
+  }
+
+  // Situation pulse ("whats up with open tickets") — short human brief, never a 35-row dump.
+  if (isOpenTicketSituationRequest(userText)) {
+    const result = await summarizeOpenTickets(
+      input.syncro,
+      { include_history: false, max_tickets: 100, sort: "attention" },
+      runtime,
+    );
+    const formatted = formatOpenTicketSituationBrief(result);
+    if (formatted) return toSlackMrkdwn(formatted);
+  }
+
+  // Easy / actionable wins — prefer New/young/in-our-court, not customer-blocked.
+  if (isEasyActionableRequest(userText)) {
+    const result = await summarizeOpenTickets(
+      input.syncro,
+      { include_history: false, max_tickets: 100, sort: "attention" },
+      runtime,
+    );
+    const formatted = formatEasyActionableBrief(result);
     if (formatted) return toSlackMrkdwn(formatted);
   }
 
@@ -1996,7 +2027,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
         sort: "newest",
         limit: 40,
       },
-      { now, dueSoonHours: input.dueSoonHours },
+      runtime,
     );
     const formatted = formatCustomerResolvedTicketsReply(result, resolvedAsk.customer);
     if (formatted) return toSlackMrkdwn(formatted);
