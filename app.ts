@@ -14,6 +14,10 @@ import { z } from "zod";
 import { buildSystemPrompt } from "./bot/lib/system-prompt.js";
 import {
   assetDetailsSchema,
+  batchSyncroRead,
+  batchSyncroReadSchema,
+  digestOpenPortfolio,
+  digestOpenPortfolioSchema,
   getAssetDetails,
   getOperationsBrief,
   getTicketSettings,
@@ -24,6 +28,8 @@ import {
   listUsers,
   listUsersSchema,
   operationsBriefSchema,
+  runResearchPlan,
+  runResearchPlanSchema,
   searchAssets,
   searchAssetsSchema,
   searchInvoices,
@@ -32,12 +38,12 @@ import {
   syncroApiReadSchema,
 } from "./bot/lib/syncro.js";
 
-const MAX_TOOL_ROUNDS = 8;
-const MAX_REQUESTS_PER_TURN = 24;
-const MAX_HISTORY_MESSAGES = 20;
+const MAX_TOOL_ROUNDS = 12;
+const MAX_REQUESTS_PER_TURN = 48;
+const MAX_HISTORY_MESSAGES = 24;
 const MEMORY_TTL_MS = 6 * 60 * 60 * 1000;
-const MODEL_TIMEOUT_MS = 60_000;
-const TURN_BUDGET_MS = 90_000;
+const MODEL_TIMEOUT_MS = 75_000;
+const TURN_BUDGET_MS = 120_000;
 
 const SECRET_PATTERN =
   /\b(?:sk-(?:proj-|or-v1-)?[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|Bearer\s+[A-Za-z0-9._~+/-]{8,}|T[0-9a-f]{6,}-[0-9a-f-]{10,})\b/gi;
@@ -57,12 +63,11 @@ const ATTENTION_ORDER = [
 ];
 
 const HELP_TEXT = [
-  "I'm your Director of IT view into Syncro — tickets, customers, assets, billing, schedule, and team workload.",
+  "I'm your Director of IT view into Syncro — I digest large queues, chain multiple API reads, and answer big-picture questions.",
   "Examples:",
-  "• Give me this morning's operations brief.",
-  "• Which customers have the most open tickets and SLA risk?",
-  "• What's on the calendar for tomorrow?",
-  "• Show invoices overdue for Acme Corp.",
+  "• Digests the open portfolio: which customers concentrate risk?",
+  "• Pull tickets + invoices + appointments for our top accounts.",
+  "• Research plan: queue health, overloaded techs, and calendar for this week.",
   "Read-only: I cannot change Syncro or send messages.",
 ].join("\n");
 
@@ -322,7 +327,7 @@ export function isUserAllowed(slackUserId: string, allowed: Set<string> | null):
 function sharedLimits(env: NodeJS.ProcessEnv): Pick<SyncroConfig, "dueSoonHours" | "maxPages" | "timeoutMs"> {
   return {
     dueSoonHours: parsePositiveInt(envValue(env, "SLA_DUE_SOON_HOURS"), 24, "SLA_DUE_SOON_HOURS", 1, 168),
-    maxPages: parsePositiveInt(envValue(env, "SYNCRO_MAX_PAGES"), 6, "SYNCRO_MAX_PAGES", 1, 10),
+    maxPages: parsePositiveInt(envValue(env, "SYNCRO_MAX_PAGES"), 10, "SYNCRO_MAX_PAGES", 1, 25),
     timeoutMs: parsePositiveInt(envValue(env, "SYNCRO_TIMEOUT_MS"), 20_000, "SYNCRO_TIMEOUT_MS", 1000, 60_000),
   };
 }
@@ -463,13 +468,19 @@ export class SyncroClient {
     }
   }
 
-  async collect(path: string, query: Query | undefined, itemsKey: string | string[]): Promise<Collected> {
+  async collect(
+    path: string,
+    query: Query | undefined,
+    itemsKey: string | string[],
+    options?: { maxPages?: number },
+  ): Promise<Collected> {
     const keys = Array.isArray(itemsKey) ? itemsKey : [itemsKey];
+    const pageLimit = Math.min(Math.max(options?.maxPages ?? this.maxPages, 1), 25);
     const items: unknown[] = [];
     let totalPages: number | null = null;
     let totalEntries: number | null = null;
     let previousSignature = "";
-    for (let page = 1; page <= this.maxPages; page += 1) {
+    for (let page = 1; page <= pageLimit; page += 1) {
       const payload = await this.get(path, { ...query, page });
       if (!isRecord(payload)) {
         throw new AppError(`Syncro response for ${path} was not an object.`, "syncro_shape", true);
@@ -498,7 +509,7 @@ export class SyncroClient {
       if (finished) {
         return { items, pagesFetched: page, totalPages, totalEntries, truncated: false };
       }
-      if (page === this.maxPages) {
+      if (page === pageLimit) {
         return {
           items,
           pagesFetched: page,
@@ -508,7 +519,7 @@ export class SyncroClient {
         };
       }
     }
-    return { items, pagesFetched: this.maxPages, totalPages, totalEntries, truncated: true };
+    return { items, pagesFetched: pageLimit, totalPages, totalEntries, truncated: true };
   }
 
   async technicians(): Promise<{ technicians: Technician[]; incomplete: boolean }> {
@@ -1648,6 +1659,59 @@ const TOOLS: ToolDefinition[] = [
       return syncroApiRead(syncro, { path: raw.path, query });
     },
   },
+  {
+    name: "digest_open_portfolio",
+    description: "Deep-scan open tickets across many Syncro pages and return a code-computed big-picture digest: metrics, top customers, technician load, and attention queue. Prefer this over dumping raw ticket lists.",
+    parameters: objectSchema({
+      created_after: { type: "string" },
+      customer_id: { type: "integer" },
+      user_id: { type: "integer" },
+      max_pages: { type: "integer", description: "Pages to scan (1-25). Default 20." },
+      top_customers: { type: "integer" },
+      top_attention: { type: "integer" },
+    }),
+    schema: digestOpenPortfolioSchema,
+    run: (args, syncro, runtime) => digestOpenPortfolio(syncro, digestOpenPortfolioSchema.parse(args), runtime),
+  },
+  {
+    name: "batch_syncro_read",
+    description: "Run up to 8 allowlisted Syncro GET requests in one call and return digested samples. Use to string together invoices + appointments + customers + assets for a big-picture answer.",
+    parameters: objectSchema({
+      requests_json: {
+        type: "string",
+        description: 'JSON array of {path, query?, label?, paginate?, max_pages?, items_key?}. Example: [{"path":"/invoices","label":"invoices"},{"path":"/appointments","label":"calendar","paginate":true}]',
+      },
+    }, ["requests_json"]),
+    schema: z.object({ requests_json: z.string().min(2).max(8_000) }),
+    run: (args, syncro) => {
+      const raw = z.object({ requests_json: z.string().min(2).max(8_000) }).parse(args);
+      const requests = JSON.parse(raw.requests_json) as unknown;
+      return batchSyncroRead(syncro, batchSyncroReadSchema.parse({ requests }));
+    },
+  },
+  {
+    name: "run_research_plan",
+    description: "Execute a multi-step Syncro research plan in one tool call (portfolio digest, metrics, ticket/customer/asset/invoice lookups, batch API reads). Use for complex big-picture investigations that need several API commands chained together.",
+    parameters: objectSchema({
+      goal: { type: "string", description: "What the investigation should answer." },
+      steps_json: {
+        type: "string",
+        description: 'JSON array of {action, args?, label?}. Actions: digest_open_portfolio, operations_brief, ticket_metrics, sla_risk, technician_workload, search_tickets, get_ticket_details, search_customers, get_customer_details, search_assets, search_invoices, list_appointments, list_contacts, list_users, ticket_settings, api_read, batch_api_read.',
+      },
+    }, ["goal", "steps_json"]),
+    schema: z.object({
+      goal: z.string().trim().min(3).max(500),
+      steps_json: z.string().min(2).max(12_000),
+    }),
+    run: (args, syncro, runtime) => {
+      const raw = z.object({
+        goal: z.string().trim().min(3).max(500),
+        steps_json: z.string().min(2).max(12_000),
+      }).parse(args);
+      const steps = JSON.parse(raw.steps_json) as unknown;
+      return runResearchPlan(syncro, runResearchPlanSchema.parse({ goal: raw.goal, steps }), runtime);
+    },
+  },
 ];
 
 export interface ToolContext {
@@ -1848,7 +1912,7 @@ async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolC
   if (!isRecord(message)) throw new AppError("The language model returned an empty message.", "llm_shape", true);
   const toolCalls: ToolCall[] = [];
   if (Array.isArray(message.tool_calls)) {
-    for (const call of message.tool_calls.slice(0, 6)) {
+    for (const call of message.tool_calls.slice(0, 8)) {
       if (!isRecord(call) || !isRecord(call.function) || typeof call.function.name !== "string") continue;
       const args = typeof call.function.arguments === "string"
         ? call.function.arguments
@@ -1911,7 +1975,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
         else result = { error: `Could not run ${call.function.name}.` };
       }
       toolResults.push(result);
-      const serialized = capJson(redactForModel(JSON.stringify(result)), 16_000);
+      const serialized = capJson(redactForModel(JSON.stringify(result)), 20_000);
       messages.push({ role: "tool", tool_call_id: call.id, content: serialized });
     }
   }

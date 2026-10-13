@@ -4,12 +4,15 @@ import {
   ConfigurationError,
   RequestBudget,
   SyncroClient,
+  batchSyncroRead,
   compareAttention,
+  digestOpenPortfolio,
   getSlaRisk,
   getTicketDetails,
   normalizeTicket,
   parseSyncroBaseUrl,
   redactForModel,
+  runResearchPlan,
   searchTickets,
   type TicketSummary,
 } from "../bot/lib/syncro.js";
@@ -223,5 +226,76 @@ describe("getSlaRisk", () => {
     };
     // Ticket 300 is due outside the window and assigned, so it is not risky.
     expect(result.needsAttention.map((t) => t.number)).toEqual([200, 100]);
+  });
+});
+
+describe("digestOpenPortfolio", () => {
+  it("rolls up customers and attention from a deep scan", async () => {
+    const syncro = mockSyncro({
+      "/tickets": () => ({
+        tickets: TICKETS,
+        meta: { total_pages: 1, total_entries: 3, per_page: 25 },
+      }),
+    });
+    const result = (await digestOpenPortfolio(syncro, { max_pages: 5, top_customers: 5 }, RUNTIME)) as {
+      mode: string;
+      byCustomer: Array<{ openCount: number }>;
+      needsAttention: Array<{ number: number | null }>;
+    };
+    expect(result.mode).toBe("deep_digest");
+    expect(result.byCustomer.length).toBeGreaterThan(0);
+    expect(result.needsAttention.map((t) => t.number)).toEqual([200, 100]);
+  });
+});
+
+describe("batchSyncroRead", () => {
+  it("digests multiple allowlisted reads", async () => {
+    const syncro = mockSyncro({
+      "/invoices": () => ({
+        invoices: [{ id: 11, number: "INV-1", status: "paid", total: 100, balance_due: 0 }],
+        meta: { total_pages: 1, total_entries: 1 },
+      }),
+      "/appointments": () => ({
+        appointments: [{ id: 21, summary: "Onsite", start_at: "2026-10-11T15:00:00.000Z" }],
+        meta: { total_pages: 1, total_entries: 1 },
+      }),
+    });
+    const result = (await batchSyncroRead(syncro, {
+      requests: [
+        { path: "/invoices", label: "billing" },
+        { path: "/appointments", label: "calendar" },
+      ],
+    })) as { successCount: number; results: Array<{ label: string; kind?: string }> };
+    expect(result.successCount).toBe(2);
+    expect(result.results.map((row) => row.label)).toEqual(["billing", "calendar"]);
+  });
+});
+
+describe("runResearchPlan", () => {
+  it("chains multiple actions in one call", async () => {
+    const syncro = mockSyncro({
+      "/tickets": () => ({
+        tickets: TICKETS,
+        meta: { total_pages: 1, total_entries: 3, per_page: 25 },
+      }),
+      "/tickets/settings": () => ({
+        ticket_status_list: ["New", "In Progress"],
+        users: [{ id: 5, name: "Erin Tech" }],
+      }),
+      "/customers": () => ({
+        customers: [{ id: 9, business_name: "Northwind" }],
+        meta: { total_pages: 1, total_entries: 1 },
+      }),
+    });
+    const result = (await runResearchPlan(syncro, {
+      goal: "Portfolio and settings",
+      steps: [
+        { action: "digest_open_portfolio", args: { max_pages: 2 }, label: "portfolio" },
+        { action: "ticket_settings", label: "settings" },
+        { action: "search_customers", args: { query: "North" }, label: "customers" },
+      ],
+    }, RUNTIME)) as { successCount: number; steps: Array<{ ok: boolean; label: string }> };
+    expect(result.successCount).toBe(3);
+    expect(result.steps.every((step) => step.ok)).toBe(true);
   });
 });
