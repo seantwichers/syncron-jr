@@ -97,14 +97,14 @@ const ATTENTION_ORDER = [
 ];
 
 const HELP_TEXT = [
-  "I'm Syncron Jr — an MSP intelligence agent for directors and service managers.",
-  "Default is *conversation mode*: I synthesize patterns, risks, and actions — I don't restate Syncro screens.",
-  "Say *lookup mode* for short factual lists, or *conversation mode* to switch back.",
+  "I'm Syncron Jr — think of me as a colleague who’s already looked at Syncro.",
+  "Default is *human mode*: plain-language takeaways, what matters, what I’d do next.",
+  "Say *structured mode* for formal briefs, or *lookup mode* for raw facts.",
   "Examples:",
-  "• Analyze the last 90 days: top recurring technical problems and what to fix first.",
-  "• Compare this month's ticket/labor trends to the prior period.",
-  "• What's the real risk in our open queue right now?",
-  "Read-only Syncro. I cite evidence and say when data is incomplete.",
+  "• What’s actually risky in the open queue right now?",
+  "• Tell me about Aspen’s resolved tickets.",
+  "• What should we fix first from the last 90 days?",
+  "Read-only Syncro. I won’t invent numbers.",
 ].join("\n");
 
 type QueryValue = string | number | boolean;
@@ -981,18 +981,16 @@ function formatCustomerResolvedTicketsReply(result: unknown, customer: string): 
       .filter((name): name is string => Boolean(name))
     : [];
   if (total === 0 && tickets.length === 0) {
-    return `No resolved tickets found for *${customer}* with the current Syncro filters.`;
+    return `I checked Syncro for *${customer}* and didn’t find resolved tickets with the current filters.`;
   }
+  const siteBit = customers.length > 1
+    ? ` across ${customers.length} sites (${customers.slice(0, 4).join("; ")}${customers.length > 4 ? "…" : ""})`
+    : customers.length === 1
+      ? ` (${customers[0]})`
+      : "";
   const lines = [
-    `*Bottom line:* ${total} resolved ticket${total === 1 ? "" : "s"} matching *${customer}*` +
-      (customers.length ? ` across ${customers.length} customer record${customers.length === 1 ? "" : "s"}` : "") +
-      `.`,
-    customers.length
-      ? `*Matched customers:* ${customers.slice(0, 8).join("; ")}${customers.length > 8 ? "…" : ""}`
-      : null,
-    result.statusNote && typeof result.statusNote === "string" ? `_${result.statusNote}_` : null,
+    `I pulled *${customer}*’s resolved history — there are about *${total}* finished tickets${siteBit}. Here are the most recent:`,
     "",
-    `*Recent resolved sample (${tickets.length}):*`,
     ...tickets.map((row) => {
       if (!isRecord(row)) return null;
       const number = typeof row.number === "number" ? `#${row.number}` : typeof row.id === "number" ? `id ${row.id}` : "ticket";
@@ -1003,9 +1001,9 @@ function formatCustomerResolvedTicketsReply(result: unknown, customer: string): 
       const assignee = typeof row.assigneeName === "string" && row.assigneeName ? row.assigneeName : "Unassigned";
       return `• ${label} · ${cust} · ${assignee} — ${subject}`;
     }).filter((line): line is string => Boolean(line)),
-  ].filter((line): line is string => line !== null);
+  ];
   if (typeof total === "number" && total > tickets.length) {
-    lines.push("", `_Showing ${tickets.length} of ${total}. Ask for a narrower site (e.g. Aspen Jet Stream) or a date range for more detail._`);
+    lines.push("", `That’s ${tickets.length} of ~${total}. If you want, I can narrow to one site or a date range.`);
   }
   return lines.join("\n");
 }
@@ -1884,7 +1882,11 @@ function toSlackMrkdwn(text: string): string {
 }
 
 async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolChoice: "auto" | "none"): Promise<ChatMessage> {
-  const temperature = input.conversationMode === "lookup" ? 0.1 : 0.25;
+  const temperature = input.conversationMode === "lookup"
+    ? 0.1
+    : input.conversationMode === "intelligence"
+      ? 0.25
+      : 0.35;
   const payload = {
     model: input.llm.model,
     temperature,
@@ -2060,14 +2062,21 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
       messages.push({ role: "tool", tool_call_id: call.id, content: serialized });
     }
   }
-  const stopInstruction = mode === "intelligence"
-    ? [
-        "Stop calling tools. Answer from the tool results already collected.",
-        "If roster[]/tickets[] from summarize_open_tickets is present, cover EVERY row — do not stop after a few examples.",
-        "Otherwise write a director briefing — executive finding, evidence anchors, interpretation, recommended action, confidence.",
-        "If evidence is insufficient, say what is missing.",
-      ].join(" ")
-    : "Stop calling tools. Answer from the tool results already collected. If they are insufficient, say what is missing.";
+  const stopInstruction = mode === "lookup"
+    ? "Stop calling tools. Answer from the tool results already collected. Keep it short and factual. If evidence is insufficient, say what is missing."
+    : mode === "intelligence"
+      ? [
+          "Stop calling tools. Answer from the tool results already collected.",
+          "If roster[]/tickets[] from summarize_open_tickets is present, cover EVERY row.",
+          "Otherwise use a structured director brief. If evidence is insufficient, say what is missing.",
+        ].join(" ")
+      : [
+          "Stop calling tools. Answer from the tool results already collected.",
+          "Human mode: reply like a colleague who already reviewed the data — plain language, what it means, what to do next.",
+          "No section headers, no tool narration, no Syncro field dumps unless they asked for a full list.",
+          "If roster[] is present and they asked for all open tickets, cover every row after a one-sentence takeaway.",
+          "If evidence is insufficient, say that simply.",
+        ].join(" ");
   messages.push({
     role: "user",
     content: stopInstruction,
@@ -2259,7 +2268,11 @@ function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
       const pendingSwitch = parseModeSwitch(trimmed);
       if (!pendingSwitch?.switchOnly) {
         const activeMode = pendingSwitch?.mode ?? await memory.getMode(memoryKey);
-        await post(activeMode === "lookup" ? "Checking Syncro…" : "Thinking through the ops picture…");
+        await post(
+          activeMode === "lookup"
+            ? "Checking Syncro…"
+            : "Looking through Syncro…",
+        );
       }
       const reply = await handleUserText({
         memoryKey,

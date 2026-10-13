@@ -41,8 +41,8 @@ describe("formatOpenTicketRundown", () => {
       roster,
       tickets: roster,
     });
-    expect(text).toMatch(/34 open tickets/);
-    expect(text).toMatch(/All open tickets \(34\)/);
+    expect(text).toMatch(/I went through the open queue/i);
+    expect(text).toMatch(/\*34\*/);
     expect((text?.match(/^• /gm) ?? []).length).toBe(34);
   });
 });

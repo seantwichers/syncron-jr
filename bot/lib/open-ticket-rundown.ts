@@ -4,7 +4,7 @@
  * silently truncated by the model to a couple of examples.
  */
 
-export const WORKER_BUILD = "resolved-tickets-v3";
+export const WORKER_BUILD = "human-brief-v4";
 
 export function isOpenTicketRundownRequest(text: string): boolean {
   const normalized = text.replace(/\s+/g, " ").trim();
@@ -94,18 +94,23 @@ export function formatOpenTicketRundown(result: unknown): string | null {
   const omitted = typeof record.omitted === "number" ? record.omitted : Math.max(0, openCount - roster.length);
   const includeHistory = record.includeHistory === true || record.mode === "open_ticket_history_digest";
 
+  const takeaway =
+    overdue != null && overdue > 0
+      ? `I went through the open queue — *${openCount}* open, and *${overdue}* of those are overdue. Here’s the full list.`
+      : `I went through the open queue — *${openCount}* open ticket${openCount === 1 ? "" : "s"}. Here’s the full list.`;
+  const coverage =
+    omitted > 0
+      ? `_Showing ${roster.length} of ${scanned} (hit the max_tickets cap)._`
+      : includeHistory
+        ? `_Full queue with short history notes._`
+        : null;
+
   const lines = [
-    `*Bottom line:* ${openCount} open ticket${openCount === 1 ? "" : "s"}` +
-      (overdue != null ? ` · ${overdue} overdue` : "") +
-      `.`,
-    `*Coverage:* showing ${roster.length} of ${scanned} scanned` +
-      (omitted > 0 ? ` (${omitted} omitted by max_tickets)` : "") +
-      (includeHistory ? " with history notes" : " (brief rundown)") +
-      ".",
+    takeaway,
+    coverage,
     "",
-    `*All open tickets (${roster.length}):*`,
     ...roster.map(formatRosterBullet),
-  ];
+  ].filter((line): line is string => line !== null);
   return lines.join("\n");
 }
 

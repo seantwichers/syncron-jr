@@ -27,16 +27,16 @@ export default slackChannel({
   onDirectMessage: handleSlack,
   suggestedPrompts: [
     {
-      title: "Ops risk brief",
-      message: "What's the real operational risk in our open queue right now, and what should we do first?",
+      title: "What's risky right now?",
+      message: "What's actually risky in our open queue right now, and what would you do first?",
     },
     {
-      title: "Recurring problems",
-      message: "Analyze the last 90 days: top recurring technical problems and what we should fix first.",
+      title: "Aspen resolved work",
+      message: "Tell me about Aspen's resolved tickets.",
     },
     {
-      title: "Conversation mode",
-      message: "conversation mode",
+      title: "Human mode",
+      message: "human mode",
     },
   ],
   suggestedPromptsTitle: "Ask Syncron Jr",
