@@ -4,7 +4,7 @@
  * silently truncated by the model to a couple of examples.
  */
 
-export const WORKER_BUILD = "open-roster-v2";
+export const WORKER_BUILD = "resolved-tickets-v3";
 
 export function isOpenTicketRundownRequest(text: string): boolean {
   const normalized = text.replace(/\s+/g, " ").trim();
