@@ -1,14 +1,14 @@
 /**
  * Conversation modes for Syncron Jr.
  *
- * intelligence (default / "conversation mode"): synthesize judgment a director
- * would not get by opening Syncro — patterns, risk, tradeoffs, actions.
- * lookup: short factual answers when the user only wants Syncro fields.
+ * human (default): talk like a colleague who already reviewed the data.
+ * intelligence: structured director brief when explicitly requested.
+ * lookup: short Syncro facts only.
  */
 
-export type ConversationMode = "intelligence" | "lookup";
+export type ConversationMode = "human" | "intelligence" | "lookup";
 
-export const DEFAULT_CONVERSATION_MODE: ConversationMode = "intelligence";
+export const DEFAULT_CONVERSATION_MODE: ConversationMode = "human";
 
 export interface ModeSwitch {
   mode: ConversationMode;
@@ -20,12 +20,20 @@ export interface ModeSwitch {
 
 const SWITCH_PATTERNS: Array<{ mode: ConversationMode; re: RegExp }> = [
   {
+    mode: "human",
+    re: /^(?:please\s+)?(?:switch\s+to\s+|use\s+|enable\s+|enter\s+)?(?:human|simple|natural|colleague|briefing)\s+mode\b[.!]?\s*/i,
+  },
+  {
     mode: "intelligence",
-    re: /^(?:please\s+)?(?:switch\s+to\s+|use\s+|enable\s+|enter\s+)?(?:conversation|intelligence|director|insight)\s+mode\b[.!]?\s*/i,
+    re: /^(?:please\s+)?(?:switch\s+to\s+|use\s+|enable\s+|enter\s+)?(?:conversation|intelligence|director|insight|structured)\s+mode\b[.!]?\s*/i,
   },
   {
     mode: "lookup",
     re: /^(?:please\s+)?(?:switch\s+to\s+|use\s+|enable\s+|enter\s+)?(?:lookup|data|raw|facts?)\s+mode\b[.!]?\s*/i,
+  },
+  {
+    mode: "human",
+    re: /^(?:talk\s+(?:to\s+me\s+)?(?:like\s+a\s+)?(?:human|person|colleague)|be\s+(?:more\s+)?(?:human|natural|simple|concise)|stop\s+(?:sounding\s+like\s+a\s+)?(?:report|bot|dashboard))\b[.!]?\s*/i,
   },
   {
     mode: "intelligence",
@@ -38,7 +46,7 @@ const SWITCH_PATTERNS: Array<{ mode: ConversationMode; re: RegExp }> = [
 ];
 
 export function isConversationMode(value: unknown): value is ConversationMode {
-  return value === "intelligence" || value === "lookup";
+  return value === "human" || value === "intelligence" || value === "lookup";
 }
 
 export function parseModeSwitch(text: string): ModeSwitch | null {
@@ -58,13 +66,20 @@ export function modeSwitchAck(mode: ConversationMode): string {
     return [
       "Switched to *lookup mode*.",
       "I’ll keep answers short and factual from Syncro.",
-      "Say *conversation mode* when you want analysis and recommendations again.",
+      "Say *human mode* when you want a normal briefing again.",
+    ].join(" ");
+  }
+  if (mode === "intelligence") {
+    return [
+      "Switched to *structured mode*.",
+      "I’ll use finding → evidence → action style briefs.",
+      "Say *human mode* for a simpler colleague-style answer.",
     ].join(" ");
   }
   return [
-    "Switched to *conversation mode* (intelligence).",
-    "I’ll synthesize patterns, risks, and actions — not restate Syncro screens.",
-    "Say *lookup mode* if you only want raw facts.",
+    "Switched to *human mode*.",
+    "I’ll answer like someone who already reviewed the data — plain language, what it means, what to do next.",
+    "Say *lookup mode* for raw facts, or *structured mode* for formal briefs.",
   ].join(" ");
 }
 
@@ -79,35 +94,43 @@ export function buildModePrompt(mode: ConversationMode): string {
     ].join("\n");
   }
 
+  if (mode === "intelligence") {
+    return [
+      "## Active mode: structured (intelligence)",
+      "Write a tight director brief:",
+      "1. Executive finding",
+      "2. Evidence (counts, IDs, coverage)",
+      "3. Interpretation",
+      "4. Recommended action",
+      "5. Confidence / limitations",
+      "Do not paste raw Syncro field dumps. For explicit all-open-ticket lists, cover every roster row.",
+    ].join("\n");
+  }
+
   return [
-    "## Active mode: conversation (intelligence) — DEFAULT",
-    "You are in a strategic conversation with an IT director. Your value is judgment Syncro does not show.",
+    "## Active mode: human — DEFAULT",
+    "You already looked at the Syncro data. Reply like a sharp colleague in Slack — not a report generator, not a dashboard, not a tool log.",
     "",
-    "### Anti-regurgitation (hard rules)",
-    "- Do NOT paste raw Syncro field dumps or narrate tool JSON.",
-    "- Tools are evidence; your reply is the briefing — except when the user explicitly asks for a rundown/list/summary of ALL open tickets.",
-    "- When they ask for all open tickets (brief rundown, full list, summary of every open ticket): use summarize_open_tickets and cover EVERY row in roster[] / tickets[]. Bullet count must match openTicketCount. Do not stop after 2–10.",
-    "- For other director questions: cite ticket IDs as anchors inside prose; do not invent a partial inventory.",
+    "### Voice",
+    "- Speak in plain first-person: “I looked through…”, “Here’s what stands out…”, “I’d start with…”.",
+    "- Assume the reader is busy. Lead with meaning, then the few numbers that matter.",
+    "- No section labels like Executive finding / Evidence / Interpretation unless they ask for a formal brief.",
+    "- No narrating tools (“I used search_tickets…”). Just answer.",
+    "- No dumping ticket inventories unless they asked for a list/rundown of all tickets.",
+    "- Sound sure when the data supports it; say “I’m not sure yet” when coverage is incomplete.",
     "",
-    "### What you must add",
-    "- Patterns and concentrations the UI hides (same failure mode, same customer, same asset class).",
-    "- Business/ops risk: SLA exposure, reopen risk, technician bottlenecks, customer health.",
-    "- Tradeoffs and prioritization: what to fix first and why (impact × effort when evidence exists).",
-    "- Blind spots: missing timers, truncated pages, weak vs confirmed relationships.",
-    "- A clear recommended next move a director can act on today.",
-    "",
-    "### Shape",
-    "Default to a tight director brief:",
-    "1. Executive finding (1–2 sentences)",
-    "2. Evidence (only the numbers/IDs that support the finding)",
-    "3. Interpretation (why it matters)",
-    "4. Recommended action",
-    "5. Confidence / limitations",
-    "Keep it conversational and concise. Expand only when asked for detail or a full list.",
-    "If the user asks a follow-up, build on conversation memory — do not restart with a Syncro dump.",
+    "### Shape (default)",
+    "1–3 short paragraphs:",
+    "1) What you conclude after reviewing the data",
+    "2) The key supporting facts (counts, a few ticket #s, who/what is hot)",
+    "3) What you’d do next",
+    "If they asked for a full list, give a one-sentence takeaway first, then the list.",
+    "For follow-ups, continue the conversation — don’t restart from a blank Syncro dump.",
   ].join("\n");
 }
 
 export function modeLabel(mode: ConversationMode): string {
-  return mode === "lookup" ? "lookup" : "conversation (intelligence)";
+  if (mode === "lookup") return "lookup";
+  if (mode === "intelligence") return "structured";
+  return "human";
 }

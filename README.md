@@ -19,9 +19,9 @@ Two runtimes share the same Syncro + intelligence logic:
 | Portfolio / attention / workload | `digest_open_portfolio`, `get_sla_risk`, `get_technician_workload` |
 | Multi-API chaining | `batch_syncro_read`, `run_research_plan` |
 | Durable Slack conversation memory | Cloudflare KV `SYNCRO_JR_MEMORY` |
-| Conversation modes | Default **conversation / intelligence** (synthesize judgment); say `lookup mode` for short Syncro facts |
+| Conversation modes | Default **human** (colleague who already reviewed the data); `structured mode` for formal briefs; `lookup mode` for raw facts |
 
-Director questions default to: **Executive finding → Evidence → Interpretation → Recommended action → Confidence and limitations.** Conversation mode refuses to regurgitate Syncro screens — it adds patterns, risk, tradeoffs, and actions.
+Default voice: plain-language takeaways — what it means and what to do next — not Syncro dumps or report templates.
 
 ## Cloudflare Worker (Slack)
 
