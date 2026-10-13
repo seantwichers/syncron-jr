@@ -52,6 +52,8 @@ import {
   searchAssetsSchema,
   searchInvoices,
   searchInvoicesSchema,
+  searchTickets as searchTicketsShared,
+  searchTicketsSchema as searchTicketsSchemaShared,
   getTicketDetails as getTicketDetailsShared,
   summarizeOpenTickets,
   summarizeOpenTicketsSchema,
@@ -59,6 +61,7 @@ import {
   syncroApiReadSchema,
   ticketDetailsSchema as sharedTicketDetailsSchema,
 } from "./bot/lib/syncro.js";
+import { parseCustomerResolvedTicketsRequest } from "./bot/lib/customer-ticket-query.js";
 import {
   analyzeOperationalTrends,
   analyzeOperationalTrendsSchema,
@@ -888,27 +891,7 @@ interface ToolRuntime {
 
 const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD.");
 
-const searchTicketsSchema = z.object({
-  query: z.string().trim().min(1).max(200).optional(),
-  status: z.string().trim().min(1).max(80).optional(),
-  number: z.string().trim().min(1).max(20).optional(),
-  customer_id: z.number().int().positive().optional(),
-  customer: z.string().trim().min(1).max(120).optional(),
-  user_id: z.number().int().positive().optional(),
-  assignee: z.string().trim().min(1).max(80).optional(),
-  created_after: dateSchema.optional(),
-  since_updated_at: dateSchema.optional(),
-  resolved_after: dateSchema.optional(),
-  include_closed: z.boolean().optional(),
-  overdue_only: z.boolean().optional(),
-  priority: z.string().trim().min(1).max(40).optional(),
-  min_age_days: z.number().min(0).max(3650).optional(),
-  max_age_days: z.number().min(0).max(3650).optional(),
-  unassigned_only: z.boolean().optional(),
-  customer_reply_only: z.boolean().optional(),
-  sort: z.enum(["attention", "oldest", "newest", "most_overdue", "updated"]).optional(),
-  limit: z.number().int().min(1).max(100).optional(),
-});
+const searchTicketsSchema = searchTicketsSchemaShared;
 
 const ticketDetailsSchema = z.object({
   ticket_id: z.number().int().positive().optional(),
@@ -940,66 +923,10 @@ const slaRiskSchema = z.object({
   limit: z.number().int().min(1).max(50).optional(),
 });
 
-type SearchTicketsArgs = z.infer<typeof searchTicketsSchema>;
-
-async function resolveAssignee(
-  syncro: SyncroClient,
-  assignee: string,
-): Promise<{ userId: number } | { choices: Technician[] } | { none: true; incomplete: boolean }> {
-  const directory = await syncro.technicians();
-  const needle = assignee.toLowerCase();
-  const exact = directory.technicians.filter((tech) => tech.name.toLowerCase() === needle);
-  const matches = exact.length
-    ? exact
-    : directory.technicians.filter((tech) => tech.name.toLowerCase().includes(needle));
-  if (matches.length === 1) {
-    const match = matches[0];
-    if (!match) return { none: true, incomplete: directory.incomplete };
-    return { userId: match.id };
-  }
-  if (matches.length > 1) return { choices: matches.slice(0, 8) };
-  return { none: true, incomplete: directory.incomplete };
-}
-
-async function resolveCustomerQuery(
-  syncro: SyncroClient,
-  customer: string,
-): Promise<{ customerId: number } | { choices: CustomerSummary[] } | { none: true }> {
-  const payload = await syncro.get("/customers", { query: customer, page: 1 });
-  if (!isRecord(payload)) return { none: true };
-  const rows = arrayField(payload, ["customers"]) ?? [];
-  const choices = rows
-    .map((row) => normalizeCustomer(row, syncro.webOrigin))
-    .filter((row): row is CustomerSummary => row !== null)
-    .slice(0, 8);
-  if (choices.length === 1) {
-    const only = choices[0];
-    return only ? { customerId: only.id } : { none: true };
-  }
-  if (choices.length > 1) return { choices };
-  return { none: true };
-}
-
-function localTicketFilter(
-  args: SearchTicketsArgs,
-  ticket: TicketSummary,
-  resolved: { userId?: number; customerId?: number },
-): boolean {
-  if (resolved.userId != null && ticket.assigneeId !== resolved.userId) return false;
-  if (resolved.customerId != null && ticket.customerId !== resolved.customerId) return false;
-  if (args.status && args.status.toLowerCase() !== "not closed" && ticket.status.toLowerCase() !== args.status.toLowerCase()) {
-    return false;
-  }
-  if (args.overdue_only && !ticket.overdue) return false;
-  if (args.unassigned_only && ticket.assigneeId != null) return false;
-  if (args.customer_reply_only && ticket.customerReply !== true) return false;
-  if (args.min_age_days != null && ticket.ageDays < args.min_age_days) return false;
-  if (args.max_age_days != null && ticket.ageDays > args.max_age_days) return false;
-  if (args.priority && ticket.priority?.toLowerCase() !== args.priority.toLowerCase()) return false;
-  return true;
-}
-
-function sortTickets(tickets: TicketSummary[], sort: SearchTicketsArgs["sort"]): TicketSummary[] {
+function sortTickets(
+  tickets: TicketSummary[],
+  sort: "attention" | "oldest" | "newest" | "most_overdue" | "updated" | undefined,
+): TicketSummary[] {
   const copy = [...tickets];
   copy.sort((left, right) => {
     if (sort === "oldest") return left.createdAt.localeCompare(right.createdAt) || left.id - right.id;
@@ -1031,91 +958,56 @@ async function scanTickets(
   return { tickets, provenance: provenanceFrom("GET /tickets", collected), dropped };
 }
 
+/** Worker/tool entry — shared Syncro search with Resolved/Closed + multi-location customer fixes. */
 export async function searchTickets(
   syncro: SyncroClient,
-  args: SearchTicketsArgs,
+  args: z.infer<typeof searchTicketsSchemaShared>,
   runtime: ToolRuntime,
 ): Promise<unknown> {
-  const narrowed = Boolean(
-    args.query || args.number || args.customer_id || args.customer || args.user_id || args.assignee ||
-      args.created_after || args.since_updated_at || args.resolved_after || args.status,
-  );
-  if (args.include_closed && !narrowed) {
-    return {
-      error: "Closed-ticket search needs a query, number, customer, assignee, status, or date bound. Syncro list results are paginated and this app will not scan the full ticket history.",
-    };
+  return searchTicketsShared(syncro, args, runtime);
+}
+
+function formatCustomerResolvedTicketsReply(result: unknown, customer: string): string | null {
+  if (!isRecord(result)) return null;
+  const tickets = Array.isArray(result.tickets) ? result.tickets : [];
+  const total = typeof result.totalAvailable === "number"
+    ? result.totalAvailable
+    : typeof result.matched === "number"
+      ? result.matched
+      : tickets.length;
+  const customers = Array.isArray(result.matchedCustomers)
+    ? result.matchedCustomers
+      .map((row) => (isRecord(row) && typeof row.name === "string" ? row.name : null))
+      .filter((name): name is string => Boolean(name))
+    : [];
+  if (total === 0 && tickets.length === 0) {
+    return `No resolved tickets found for *${customer}* with the current Syncro filters.`;
   }
-  let userId = args.user_id;
-  if (!userId && args.assignee) {
-    const resolved = await resolveAssignee(syncro, args.assignee);
-    if ("choices" in resolved) {
-      return { technicians: resolved.choices, tickets: [], note: "More than one technician matched. Pass user_id." };
-    }
-    if ("none" in resolved) {
-      return {
-        tickets: [],
-        note: resolved.incomplete
-          ? "No technician matched, and the technician directory may be incomplete."
-          : `No technician matched "${args.assignee}".`,
-      };
-    }
-    userId = resolved.userId;
+  const lines = [
+    `*Bottom line:* ${total} resolved ticket${total === 1 ? "" : "s"} matching *${customer}*` +
+      (customers.length ? ` across ${customers.length} customer record${customers.length === 1 ? "" : "s"}` : "") +
+      `.`,
+    customers.length
+      ? `*Matched customers:* ${customers.slice(0, 8).join("; ")}${customers.length > 8 ? "…" : ""}`
+      : null,
+    result.statusNote && typeof result.statusNote === "string" ? `_${result.statusNote}_` : null,
+    "",
+    `*Recent resolved sample (${tickets.length}):*`,
+    ...tickets.map((row) => {
+      if (!isRecord(row)) return null;
+      const number = typeof row.number === "number" ? `#${row.number}` : typeof row.id === "number" ? `id ${row.id}` : "ticket";
+      const url = typeof row.url === "string" ? row.url : null;
+      const label = url ? `<${url}|${number}>` : number;
+      const subject = typeof row.subject === "string" ? row.subject : "(no subject)";
+      const cust = typeof row.customerName === "string" ? row.customerName : customer;
+      const assignee = typeof row.assigneeName === "string" && row.assigneeName ? row.assigneeName : "Unassigned";
+      return `• ${label} · ${cust} · ${assignee} — ${subject}`;
+    }).filter((line): line is string => Boolean(line)),
+  ].filter((line): line is string => line !== null);
+  if (typeof total === "number" && total > tickets.length) {
+    lines.push("", `_Showing ${tickets.length} of ${total}. Ask for a narrower site (e.g. Aspen Jet Stream) or a date range for more detail._`);
   }
-  let customerId = args.customer_id;
-  if (!customerId && args.customer) {
-    const resolved = await resolveCustomerQuery(syncro, args.customer);
-    if ("choices" in resolved) {
-      return { customers: resolved.choices, tickets: [], note: "More than one customer matched. Pass customer_id." };
-    }
-    if ("none" in resolved) return { tickets: [], note: `No customer matched "${args.customer}".` };
-    customerId = resolved.customerId;
-  }
-  const query: Query = {};
-  const serverFilters: string[] = [];
-  const add = (key: string, value: QueryValue | undefined) => {
-    if (value === undefined) return;
-    query[key] = value;
-    serverFilters.push(`${key}=${String(value)}`);
-  };
-  add("customer_id", customerId);
-  add("user_id", userId);
-  add("number", args.number);
-  add("query", args.query);
-  add("created_after", args.created_after);
-  add("since_updated_at", args.since_updated_at);
-  add("resolved_after", args.resolved_after);
-  if (args.status) add("status", args.status);
-  else if (!args.include_closed && !args.number && !args.query) add("status", "Not Closed");
-  const scanned = await scanTickets(syncro, query, runtime);
-  const filtered = scanned.tickets.filter((ticket) => localTicketFilter(args, ticket, {
-    ...(userId != null ? { userId } : {}),
-    ...(customerId != null ? { customerId } : {}),
-  }));
-  const sort = args.sort ?? "attention";
-  const limit = args.limit ?? 50;
-  const ordered = sortTickets(filtered, sort).slice(0, limit);
-  const localFilters = [
-    args.overdue_only ? "overdue_only" : null,
-    args.priority ? `priority=${args.priority} (exact, local)` : null,
-    args.min_age_days != null ? `min_age_days=${args.min_age_days}` : null,
-    args.max_age_days != null ? `max_age_days=${args.max_age_days}` : null,
-    args.unassigned_only ? "unassigned_only" : null,
-    args.customer_reply_only ? "customer_reply_only" : null,
-  ].filter((item): item is string => Boolean(item));
-  return {
-    tickets: ordered,
-    matched: filtered.length,
-    returned: ordered.length,
-    sort,
-    rankingOrder: ATTENTION_ORDER,
-    serverFilters,
-    localFilters,
-    droppedUnreadable: scanned.dropped,
-    provenance: scanned.provenance,
-    note: scanned.provenance.truncated
-      ? "Syncro had more pages than this request loaded. Filters and counts may be incomplete."
-      : "Priority, age, overdue, unassigned, and customer-reply filters run locally. Syncro's ticket list does not document those query parameters.",
-  };
+  return lines.join("\n");
 }
 
 interface CommentExcerpt {
@@ -1556,19 +1448,19 @@ const objectSchema = (properties: Record<string, JsonSchemaProperty>, required: 
 const TOOLS: ToolDefinition[] = [
   {
     name: "search_tickets",
-    description: "Search Syncro tickets. Defaults to open tickets with the documented status filter Not Closed. Returns up to 100 tickets (default 50). For a full history digest of every open ticket, prefer summarize_open_tickets.",
+    description: "Search Syncro tickets. Defaults to open (status=Not Closed). For resolved/closed history use status=Resolved (this tenant has no Closed status; Closed is mapped to Resolved). Customer names like Aspen may match multiple locations — the tool searches across the group and returns totalAvailable. Returns up to 100 tickets (default 50).",
     parameters: objectSchema({
       query: { type: "string", description: "Free-text query passed to Syncro." },
-      status: { type: "string", description: "Exact Syncro status. Not Closed is a documented open-ticket filter." },
+      status: { type: "string", description: "Syncro status. Use Resolved for closed work; Not Closed for open. Closed/complete aliases map to Resolved." },
       number: { type: "string", description: "Exact ticket number." },
       customer_id: { type: "integer" },
-      customer: { type: "string", description: "Customer name. Resolved with GET /customers?query= before the ticket search." },
+      customer: { type: "string", description: "Customer name. Multi-location matches (e.g. Aspen) search across the group instead of returning empty." },
       user_id: { type: "integer", description: "Assignee user id." },
       assignee: { type: "string", description: "Assignee name. Resolved from ticket settings before the ticket search." },
       created_after: { type: "string", description: "YYYY-MM-DD, passed to Syncro created_after." },
       since_updated_at: { type: "string", description: "YYYY-MM-DD, passed to Syncro since_updated_at." },
       resolved_after: { type: "string", description: "YYYY-MM-DD, passed to Syncro resolved_after." },
-      include_closed: { type: "boolean" },
+      include_closed: { type: "boolean", description: "Set true with a customer/query when asking for resolved/closed history." },
       overdue_only: { type: "boolean" },
       priority: { type: "string", description: "Exact priority text, matched locally." },
       min_age_days: { type: "number" },
@@ -2087,6 +1979,24 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
       { now, dueSoonHours: input.dueSoonHours },
     );
     const formatted = formatOpenTicketRundown(result);
+    if (formatted) return toSlackMrkdwn(formatted);
+  }
+
+  // Deterministic path: "Aspen's resolved tickets" (this tenant uses status Resolved, not Closed).
+  const resolvedAsk = parseCustomerResolvedTicketsRequest(userText);
+  if (resolvedAsk) {
+    const result = await searchTicketsShared(
+      input.syncro,
+      {
+        customer: resolvedAsk.customer,
+        status: resolvedAsk.status,
+        include_closed: true,
+        sort: "newest",
+        limit: 40,
+      },
+      { now, dueSoonHours: input.dueSoonHours },
+    );
+    const formatted = formatCustomerResolvedTicketsReply(result, resolvedAsk.customer);
     if (formatted) return toSlackMrkdwn(formatted);
   }
 

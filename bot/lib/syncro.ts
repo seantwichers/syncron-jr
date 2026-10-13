@@ -746,23 +746,74 @@ async function resolveAssignee(
   return { none: true, incomplete: directory.incomplete };
 }
 
+/** Rank how strongly a customer record matches a free-text customer query. */
+export function customerMatchScore(customer: CustomerSummary, query: string): number {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return 0;
+  const name = customer.name.toLowerCase();
+  if (name === needle) return 100;
+  if (name.startsWith(needle)) return 90;
+  if (name.includes(needle)) return 80;
+  // Weak contact-style hits (Syncro query can return people who merely mention the token).
+  const tokens = needle.split(/\s+/).filter(Boolean);
+  if (tokens.length && tokens.every((token) => name.includes(token))) return 40;
+  return 0;
+}
+
+/**
+ * Map common language / wrong Syncro status names onto this tenant's statuses.
+ * This MSP uses "Resolved" — there is no "Closed" status in ticket settings.
+ */
+export function canonicalizeTicketStatus(status: string | undefined): string | undefined {
+  if (!status) return undefined;
+  const trimmed = status.trim();
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  if (lower === "not closed" || lower === "open") return "Not Closed";
+  if (
+    lower === "closed" ||
+    lower === "complete" ||
+    lower === "completed" ||
+    lower === "done" ||
+    lower === "resolved"
+  ) {
+    return "Resolved";
+  }
+  return trimmed;
+}
+
 async function resolveCustomerQuery(
   syncro: SyncroReader,
   customer: string,
-): Promise<{ customerId: number } | { choices: CustomerSummary[] } | { none: true }> {
+): Promise<
+  | { customerId: number; matched: CustomerSummary }
+  | { choices: CustomerSummary[]; groupQuery: string }
+  | { none: true }
+> {
   const payload = await syncro.get("/customers", { query: customer, page: 1 });
   if (!isRecord(payload)) return { none: true };
   const rows = arrayField(payload, ["customers"]) ?? [];
-  const choices = rows
+  const all = rows
     .map((row) => normalizeCustomer(row, syncro.webOrigin))
-    .filter((row): row is CustomerSummary => row !== null)
-    .slice(0, 8);
-  if (choices.length === 1) {
-    const only = choices[0];
-    return only ? { customerId: only.id } : { none: true };
+    .filter((row): row is CustomerSummary => row !== null);
+  if (!all.length) return { none: true };
+
+  const scored = all
+    .map((row) => ({ row, score: customerMatchScore(row, customer) }))
+    .sort((left, right) => right.score - left.score || left.row.name.localeCompare(right.row.name));
+
+  // Prefer business-name hits (score >= 80) over incidental contact matches.
+  const strong = scored.filter((item) => item.score >= 80).map((item) => item.row);
+  const ranked = (strong.length ? strong : scored.filter((item) => item.score > 0).map((item) => item.row))
+    .slice(0, 12);
+
+  if (!ranked.length) return { none: true };
+  if (ranked.length === 1) {
+    const only = ranked[0]!;
+    return { customerId: only.id, matched: only };
   }
-  if (choices.length > 1) return { choices };
-  return { none: true };
+  // Multiple Aspen Auto Clinic locations, etc. — caller should search by group query.
+  return { choices: ranked.slice(0, 8), groupQuery: customer.trim() };
 }
 
 function localTicketFilter(
@@ -822,13 +873,19 @@ export async function searchTickets(
   args: SearchTicketsArgs,
   runtime: ToolRuntime,
 ): Promise<unknown> {
+  const status = canonicalizeTicketStatus(args.status);
+  const lookingBeyondOpen = Boolean(
+    args.include_closed ||
+      (status && status !== "Not Closed") ||
+      args.resolved_after,
+  );
   const narrowed = Boolean(
     args.query || args.number || args.customer_id || args.customer || args.user_id || args.assignee ||
-      args.created_after || args.since_updated_at || args.resolved_after || args.status,
+      args.created_after || args.since_updated_at || args.resolved_after || status,
   );
   if (args.include_closed && !narrowed) {
     return {
-      error: "Closed-ticket search needs a query, number, customer, assignee, status, or date bound. Syncro list results are paginated and this app will not scan the full ticket history.",
+      error: "Closed/resolved ticket search needs a query, number, customer, assignee, status, or date bound. Syncro list results are paginated and this app will not scan the full ticket history.",
     };
   }
   let userId = args.user_id;
@@ -847,15 +904,31 @@ export async function searchTickets(
     }
     userId = resolved.userId;
   }
+
   let customerId = args.customer_id;
+  let matchedCustomers: CustomerSummary[] | undefined;
+  let customerGroupQuery: string | undefined;
+  let customerNote: string | undefined;
+
   if (!customerId && args.customer) {
     const resolved = await resolveCustomerQuery(syncro, args.customer);
-    if ("choices" in resolved) {
-      return { customers: resolved.choices, tickets: [], note: "More than one customer matched. Pass customer_id." };
+    if ("none" in resolved) {
+      return { tickets: [], note: `No customer matched "${args.customer}".` };
     }
-    if ("none" in resolved) return { tickets: [], note: `No customer matched "${args.customer}".` };
-    customerId = resolved.customerId;
+    if ("customerId" in resolved) {
+      customerId = resolved.customerId;
+      matchedCustomers = [resolved.matched];
+    } else {
+      // Multiple locations (e.g. Aspen Auto Clinic *) — search tickets by query across the group
+      // instead of returning an empty ticket list that the model misreads as "none".
+      matchedCustomers = resolved.choices;
+      customerGroupQuery = resolved.groupQuery;
+      customerNote =
+        `Matched ${resolved.choices.length} customers for "${args.customer}". ` +
+        "Searching tickets with that customer query across the group (not a single customer_id).";
+    }
   }
+
   const query: Query = {};
   const serverFilters: string[] = [];
   const add = (key: string, value: QueryValue | undefined) => {
@@ -866,18 +939,38 @@ export async function searchTickets(
   add("customer_id", customerId);
   add("user_id", userId);
   add("number", args.number);
-  add("query", args.query);
+  // Group customer match uses Syncro's ticket query; don't also require customer_id.
+  if (customerGroupQuery) {
+    add("query", args.query ? `${customerGroupQuery} ${args.query}` : customerGroupQuery);
+  } else {
+    add("query", args.query);
+  }
   add("created_after", args.created_after);
   add("since_updated_at", args.since_updated_at);
   add("resolved_after", args.resolved_after);
-  if (args.status) add("status", args.status);
-  else if (!args.include_closed && !args.number && !args.query) add("status", "Not Closed");
-  const scanned = await scanTickets(syncro, query, runtime);
-  const filtered = scanned.tickets.filter((ticket) => localTicketFilter(args, ticket, {
+
+  if (status) {
+    add("status", status);
+  } else if (!lookingBeyondOpen && !args.number && !args.query && !customerGroupQuery) {
+    // Default open-queue filter. Never apply it for resolved/closed history or multi-customer query searches.
+    add("status", "Not Closed");
+  } else if (!status && lookingBeyondOpen && !args.number) {
+    // "Resolved tickets" with include_closed / resolved_after and no explicit status → this tenant's Resolved.
+    add("status", "Resolved");
+  }
+
+  // When filtering resolved history, paginate further so "hundreds" are visible in provenance.
+  const maxPages = lookingBeyondOpen || customerGroupQuery ? 10 : undefined;
+  const scanned = await scanTickets(syncro, query, runtime, maxPages ? { maxPages } : undefined);
+
+  // For group query searches, args.status may have been canonicalized — apply local filter with canonical status.
+  const filterArgs: SearchTicketsArgs = { ...args, status };
+  const filtered = scanned.tickets.filter((ticket) => localTicketFilter(filterArgs, ticket, {
     ...(userId != null ? { userId } : {}),
-    ...(customerId != null ? { customerId } : {}),
+    // Only enforce customer_id locally when we bound the server query to one id.
+    ...(customerId != null && !customerGroupQuery ? { customerId } : {}),
   }));
-  const sort = args.sort ?? "attention";
+  const sort = args.sort ?? (lookingBeyondOpen ? "newest" : "attention");
   const limit = args.limit ?? 50;
   const ordered = sortTickets(filtered, sort).slice(0, limit);
   const localFilters = [
@@ -888,19 +981,42 @@ export async function searchTickets(
     args.unassigned_only ? "unassigned_only" : null,
     args.customer_reply_only ? "customer_reply_only" : null,
   ].filter((item): item is string => Boolean(item));
+
+  const totalEntries = scanned.provenance.totalEntries;
   return {
     tickets: ordered,
     matched: filtered.length,
     returned: ordered.length,
+    totalAvailable: totalEntries,
     sort,
     rankingOrder: ATTENTION_ORDER,
     serverFilters,
     localFilters,
+    statusApplied: typeof query.status === "string" ? query.status : null,
+    statusNote:
+      args.status && status && args.status !== status
+        ? `Mapped status "${args.status}" → "${status}" (this Syncro tenant uses Resolved, not Closed).`
+        : null,
+    matchedCustomers,
+    customerGroupQuery: customerGroupQuery ?? null,
     droppedUnreadable: scanned.dropped,
     provenance: scanned.provenance,
-    note: scanned.provenance.truncated
-      ? "Syncro had more pages than this request loaded. Filters and counts may be incomplete."
-      : "Priority, age, overdue, unassigned, and customer-reply filters run locally. Syncro's ticket list does not document those query parameters.",
+    guidance: [
+      "If totalAvailable > returned, say how many exist and summarize the returned sample — do not claim there are none.",
+      "This tenant's closed-work status is usually Resolved (there is typically no Closed status).",
+      customerNote ?? null,
+    ].filter(Boolean),
+    note: [
+      customerNote,
+      scanned.provenance.truncated
+        ? `Syncro reports ${totalEntries ?? "more"} matching tickets; loaded ${scanned.provenance.pagesFetched} page(s). Counts may be incomplete.`
+        : null,
+      totalEntries != null && totalEntries > ordered.length
+        ? `Showing ${ordered.length} of ${totalEntries} matching tickets.`
+        : null,
+      "Priority, age, overdue, unassigned, and customer-reply filters run locally.",
+    ].filter(Boolean).join(" ") ||
+      "Priority, age, overdue, unassigned, and customer-reply filters run locally.",
   };
 }
 
