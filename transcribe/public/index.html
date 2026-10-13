@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Transcribe</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">On this computer</p>
+        <h1>Transcribe</h1>
+        <p class="lede">
+          Upload an audio file, pick a provider, and paste your own API key.
+          The key stays in this browser unless you also put it in a local env file.
+          Each request goes only to the provider you select.
+        </p>
+      </header>
+
+      <form id="form">
+        <div class="drop" id="drop">
+          <label class="drop-label" for="file">
+            <span class="drop-title" id="drop-title">Choose an audio file</span>
+            <span class="drop-hint" id="file-hint">mp3, wav, m4a, webm, ogg, or flac.</span>
+          </label>
+          <input
+            id="file"
+            name="file"
+            type="file"
+            accept=".mp3,.wav,.m4a,.webm,.ogg,.flac,audio/mpeg,audio/wav,audio/mp4,audio/webm,audio/ogg,audio/flac"
+          />
+        </div>
+
+        <div class="grid">
+          <label>
+            Provider
+            <select id="provider" name="provider"></select>
+          </label>
+          <label>
+            Model
+            <select id="model" name="model"></select>
+          </label>
+        </div>
+
+        <label>
+          Custom model id
+          <input
+            id="custom-model"
+            name="customModel"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Optional. Overrides the list above."
+          />
+        </label>
+
+        <label>
+          API key
+          <span class="key-row">
+            <input
+              id="api-key"
+              name="apiKey"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Paste a key for the selected provider"
+            />
+            <button id="toggle-key" type="button">Show</button>
+          </span>
+        </label>
+        <p class="hint" id="key-hint"></p>
+        <label class="check">
+          <input id="remember" type="checkbox" checked />
+          Remember this key in this browser
+        </label>
+
+        <button id="submit" type="submit">Transcribe</button>
+        <button id="forget" class="text-button" type="button">Remove saved keys</button>
+      </form>
+
+      <p id="status" class="status" role="status"></p>
+      <p id="error" class="error" role="alert" hidden></p>
+
+      <section id="result" hidden>
+        <div class="result-bar">
+          <h2>Transcript</h2>
+          <div class="result-actions">
+            <button id="copy" type="button">Copy</button>
+            <button id="download" type="button">Download .txt</button>
+          </div>
+        </div>
+        <textarea id="transcript" spellcheck="false" aria-label="Transcript"></textarea>
+        <p class="hint">Plain text. You can edit it before copying or downloading.</p>
+      </section>
+    </main>
+    <noscript>Enable JavaScript to use this local page.</noscript>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
