@@ -14,7 +14,7 @@ export function asJson(value: unknown): JsonObject {
   return JSON.parse(JSON.stringify(value)) as JsonObject;
 }
 
-const MAX_REQUESTS_PER_TURN = 12;
+const MAX_REQUESTS_PER_TURN = 24;
 
 export function parseAllowlist(raw: string | undefined): Set<string> | null {
   if (!raw) return null;

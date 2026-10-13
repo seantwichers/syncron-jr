@@ -136,9 +136,9 @@ describe("normalizeTicket and attention", () => {
 });
 
 describe("redactForModel", () => {
-  it("strips email and secrets", () => {
+  it("strips secrets but keeps contact text for director replies", () => {
     const text = redactForModel("Call me at tech@example.com key sk-proj-abcdefghijklmnop");
-    expect(text).not.toMatch(/example\.com/);
+    expect(text).toMatch(/example\.com/);
     expect(text).toContain("[redacted-secret]");
   });
 });
