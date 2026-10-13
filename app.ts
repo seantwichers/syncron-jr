@@ -22,6 +22,13 @@ import {
   slackMemoryKey,
   type StoredMessage,
 } from "./bot/lib/conversation-memory.js";
+import {
+  WORKER_BUILD,
+  ensureCompleteOpenTicketRundown,
+  formatOpenTicketRundown,
+  isOpenTicketRundownRequest,
+  wantsOpenTicketHistory,
+} from "./bot/lib/open-ticket-rundown.js";
 import { buildSystemPrompt } from "./bot/lib/system-prompt.js";
 import {
   assetDetailsSchema,
@@ -2065,6 +2072,24 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   const now = input.now ?? new Date();
   const deadline = input.deadlineMs ?? Date.now() + TURN_BUDGET_MS;
   const mode = input.conversationMode ?? "intelligence";
+  const userText = truncate(redactSecrets(input.userText), 2000);
+
+  // Deterministic path: "all open tickets" rundowns must list every ticket.
+  // The model repeatedly under-covers large queues (e.g. 2 of 34).
+  if (isOpenTicketRundownRequest(userText)) {
+    const result = await summarizeOpenTickets(
+      input.syncro,
+      {
+        include_history: wantsOpenTicketHistory(userText),
+        max_tickets: 100,
+        sort: "attention",
+      },
+      { now, dueSoonHours: input.dueSoonHours },
+    );
+    const formatted = formatOpenTicketRundown(result);
+    if (formatted) return toSlackMrkdwn(formatted);
+  }
+
   const briefing = input.conversationBriefing?.trim();
   const memoryBlock = briefing
     ? [
@@ -2079,7 +2104,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     ...input.history.map((message) => ({ role: message.role, content: message.content })),
     {
       role: "user",
-      content: `Request time: ${now.toISOString()}\n${truncate(redactSecrets(input.userText), 2000)}`,
+      content: `Request time: ${now.toISOString()}\n${userText}`,
     },
   ];
   const toolResults: unknown[] = [];
@@ -2090,6 +2115,14 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     authorize: input.authorize,
   };
   const toolJsonCap = mode === "intelligence" ? 100_000 : 120_000;
+  const finalizeReply = (reply: string): string =>
+    toSlackMrkdwn(
+      ensureCompleteOpenTicketRundown(
+        withTicketLinks(redactForModel(reply), toolResults),
+        toolResults,
+        userText,
+      ),
+    );
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
     if (Date.now() > deadline) {
       throw new AppError("That request took too long. Try a narrower question.", "turn_timeout", true);
@@ -2099,7 +2132,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     if (!assistant.tool_calls?.length) {
       const reply = assistant.content?.trim();
       if (!reply) throw new AppError("The language model returned an empty answer.", "llm_empty", true);
-      return toSlackMrkdwn(withTicketLinks(redactForModel(reply), toolResults));
+      return finalizeReply(reply);
     }
     for (const call of assistant.tool_calls) {
       let parsed: unknown = {};
@@ -2120,8 +2153,9 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   const stopInstruction = mode === "intelligence"
     ? [
         "Stop calling tools. Answer from the tool results already collected.",
-        "Conversation mode: write a director briefing — executive finding, evidence anchors, interpretation, recommended action, confidence.",
-        "Do not regurgitate Syncro fields or paste ticket inventories. If evidence is insufficient, say what is missing.",
+        "If roster[]/tickets[] from summarize_open_tickets is present, cover EVERY row — do not stop after a few examples.",
+        "Otherwise write a director briefing — executive finding, evidence anchors, interpretation, recommended action, confidence.",
+        "If evidence is insufficient, say what is missing.",
       ].join(" ")
     : "Stop calling tools. Answer from the tool results already collected. If they are insufficient, say what is missing.";
   messages.push({
@@ -2131,7 +2165,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   const finalMessage = await completeChat(input, messages, "none");
   const reply = finalMessage.content?.trim();
   if (!reply) throw new AppError("The language model returned an empty answer.", "llm_empty", true);
-  return toSlackMrkdwn(withTicketLinks(redactForModel(reply), toolResults));
+  return finalizeReply(reply);
 }
 
 export interface HandleTextOptions {
@@ -2510,7 +2544,11 @@ export async function handleWorkerRequest(
 ): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-    return Response.json({ ok: true, service: "msp-assistant" });
+    return Response.json({
+      ok: true,
+      service: "msp-assistant",
+      build: WORKER_BUILD,
+    });
   }
   if (request.method !== "POST") return new Response("Not found", { status: 404 });
 
