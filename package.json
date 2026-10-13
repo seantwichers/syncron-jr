@@ -14,6 +14,7 @@
     "deploy:worker": "wrangler deploy",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
     "validate": "bdk validate --dir ."
   },
   "dependencies": {

@@ -47,6 +47,12 @@ import {
   syncroApiReadSchema,
   ticketDetailsSchema as sharedTicketDetailsSchema,
 } from "./bot/lib/syncro.js";
+import {
+  analyzeOperationalTrends,
+  analyzeOperationalTrendsSchema,
+  investigateRecurringProblems,
+  investigateRecurringProblemsSchema,
+} from "./bot/lib/intelligence.js";
 
 export type { StoredMessage };
 export { ConversationMemory, slackMemoryKey };
@@ -76,12 +82,12 @@ const ATTENTION_ORDER = [
 ];
 
 const HELP_TEXT = [
-  "I'm Syncron Jr — your Director of IT for Syncro. I keep our conversation in mind, give executive briefs, and drill into tickets when it matters.",
+  "I'm Syncron Jr — an MSP intelligence agent for directors and service managers.",
   "Examples:",
-  "• Morning brief: where is risk concentrated?",
-  "• Follow up: dig into that Parker Hotel ticket we just discussed.",
-  "• Cross-cut: tickets + invoices + this week's appointments for our hottest accounts.",
-  "Read-only: I cannot change Syncro or send messages.",
+  "• Analyze the last 90 days: top recurring technical problems and what to fix first.",
+  "• Compare this month's ticket/labor trends to the prior period.",
+  "• Summarize all open tickets with what happened on each.",
+  "Read-only Syncro. I cite evidence and say when data is incomplete.",
 ].join("\n");
 
 type QueryValue = string | number | boolean;
@@ -1703,6 +1709,35 @@ const TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "investigate_recurring_problems",
+    description: "Director investigation: find recurring technical problem clusters across historical Syncro tickets with evidence, ticket IDs, reopens, recorded labor when timers exist, confidence, and recommended actions. Use for 'biggest recurring problems' / 'what should we fix first'.",
+    parameters: objectSchema({
+      lookback_days: { type: "integer", description: "Historical lookback in days (7-365, default 90)." },
+      customer_id: { type: "integer" },
+      user_id: { type: "integer" },
+      max_clusters: { type: "integer", description: "Max clusters to return (1-15, default 5)." },
+      min_confidence: { type: "string", enum: ["weak", "probable", "confirmed"] },
+      max_pages: { type: "integer" },
+      enrich_limit: { type: "integer" },
+    }),
+    schema: investigateRecurringProblemsSchema,
+    run: (args, syncro, runtime) =>
+      investigateRecurringProblems(syncro, investigateRecurringProblemsSchema.parse(args), runtime),
+  },
+  {
+    name: "analyze_operational_trends",
+    description: "Compare operational metrics for a recent period vs the preceding baseline (new vs resolved, backlog, reopens, recorded labor, SLA flags). Reports coverage; missing timers are unknown, not zero.",
+    parameters: objectSchema({
+      period_days: { type: "integer", description: "Current window length in days (default 30); baseline is the equal prior window." },
+      customer_id: { type: "integer" },
+      user_id: { type: "integer" },
+      max_pages: { type: "integer" },
+    }),
+    schema: analyzeOperationalTrendsSchema,
+    run: (args, syncro, runtime) =>
+      analyzeOperationalTrends(syncro, analyzeOperationalTrendsSchema.parse(args), runtime),
+  },
+  {
     name: "summarize_open_tickets",
     description: "Summarize ALL open tickets with full comment history digests (what happened on each ticket). Use when the user asks for a summary of open tickets, everything that happened, or a portfolio walkthrough. Returns many tickets (default 50, up to 100), not a top-10 list.",
     parameters: objectSchema({
@@ -1724,7 +1759,7 @@ const TOOLS: ToolDefinition[] = [
       goal: { type: "string", description: "What the investigation should answer." },
       steps_json: {
         type: "string",
-        description: 'JSON array of {action, args?, label?}. Actions: digest_open_portfolio, summarize_open_tickets, operations_brief, ticket_metrics, sla_risk, technician_workload, search_tickets, get_ticket_details, search_customers, get_customer_details, search_assets, search_invoices, list_appointments, list_contacts, list_users, ticket_settings, api_read, batch_api_read.',
+        description: 'JSON array of {action, args?, label?}. Actions include investigate_recurring_problems, analyze_operational_trends, digest_open_portfolio, summarize_open_tickets, operations_brief, ticket_metrics, sla_risk, technician_workload, search_tickets, get_ticket_details, search_customers, get_customer_details, search_assets, search_invoices, list_appointments, list_contacts, list_users, ticket_settings, api_read, batch_api_read.',
       },
     }, ["goal", "steps_json"]),
     schema: z.object({

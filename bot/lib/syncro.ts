@@ -2141,6 +2141,8 @@ function inferItemsKey(path: string): string {
 const researchActionSchema = z.enum([
   "digest_open_portfolio",
   "summarize_open_tickets",
+  "investigate_recurring_problems",
+  "analyze_operational_trends",
   "operations_brief",
   "ticket_metrics",
   "sla_risk",
@@ -2219,6 +2221,22 @@ async function executeResearchAction(
       return digestOpenPortfolio(syncro, digestOpenPortfolioSchema.parse(rawArgs), runtime);
     case "summarize_open_tickets":
       return summarizeOpenTickets(syncro, summarizeOpenTicketsSchema.parse(rawArgs), runtime);
+    case "investigate_recurring_problems": {
+      const intel = await import("./intelligence.js");
+      return intel.investigateRecurringProblems(
+        syncro,
+        intel.investigateRecurringProblemsSchema.parse(rawArgs),
+        runtime,
+      );
+    }
+    case "analyze_operational_trends": {
+      const intel = await import("./intelligence.js");
+      return intel.analyzeOperationalTrends(
+        syncro,
+        intel.analyzeOperationalTrendsSchema.parse(rawArgs),
+        runtime,
+      );
+    }
     case "operations_brief":
       return getOperationsBrief(syncro, operationsBriefSchema.parse(rawArgs), runtime);
     case "ticket_metrics":
