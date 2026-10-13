@@ -191,6 +191,63 @@ function capJson(text: string, max: number): string {
   return JSON.stringify({ truncated: true, preview: text.slice(0, Math.max(0, max - 80)) });
 }
 
+/**
+ * Serialize tool results for the model. Prefer keeping complete ticket rosters
+ * when payloads are large — never collapse a 34-ticket queue into a 2-ticket preview.
+ */
+function serializeToolResult(result: unknown, max: number): string {
+  const redacted = redactForModel(JSON.stringify(result));
+  if (redacted.length <= max) return redacted;
+  if (!isRecord(result)) return capJson(redacted, max);
+
+  const roster = Array.isArray(result.roster)
+    ? result.roster
+    : Array.isArray(result.tickets)
+      ? result.tickets
+      : null;
+
+  if (roster && roster.length > 0) {
+    const compactRoster = roster.map((row) => {
+      if (!isRecord(row)) return row;
+      return {
+        number: row.number ?? null,
+        id: row.id ?? null,
+        subject: typeof row.subject === "string" ? row.subject.slice(0, 120) : row.subject ?? null,
+        status: row.status ?? null,
+        customerName: row.customerName ?? null,
+        assigneeName: row.assigneeName ?? null,
+        ageDays: row.ageDays ?? null,
+        overdue: row.overdue ?? null,
+        url: row.url ?? null,
+        attention: Array.isArray(row.attention)
+          ? row.attention.slice(0, 2)
+          : Array.isArray(row.attentionReasons)
+            ? row.attentionReasons.slice(0, 2)
+            : undefined,
+      };
+    });
+    const compacted: Record<string, unknown> = {
+      truncatedForModel: true,
+      mode: result.mode,
+      headline: result.headline,
+      openTicketCount: result.openTicketCount ?? compactRoster.length,
+      rosterCount: compactRoster.length,
+      returned: compactRoster.length,
+      omitted: result.omitted ?? 0,
+      portfolio: result.portfolio,
+      roster: compactRoster,
+      tickets: compactRoster,
+      replyInstruction: result.replyInstruction
+        ?? "Cover EVERY roster row. Bullet count must equal rosterCount.",
+      note: "Full tool payload was large; compact roster retained so every open ticket remains visible.",
+    };
+    const compactedJson = redactForModel(JSON.stringify(compacted));
+    if (compactedJson.length <= max) return compactedJson;
+  }
+
+  return capJson(redacted, max);
+}
+
 function plainText(input: string): string {
   return input
     .replace(/<br\s*\/?>/gi, "\n")
@@ -1746,15 +1803,15 @@ const TOOLS: ToolDefinition[] = [
   },
   {
     name: "summarize_open_tickets",
-    description: "Summarize ALL open tickets with full comment history digests (what happened on each ticket). Use when the user asks for a summary of open tickets, everything that happened, or a portfolio walkthrough. Returns many tickets (default 50, up to 100), not a top-10 list.",
+    description: "Rundown of ALL open tickets (status=Not Closed). Default is a brief one-liner per ticket covering the full open queue (default max 100). Set include_history=true only when the user wants comment-history digests / what happened on each ticket. Never use a top-2/top-10 attention tool for 'all open tickets'.",
     parameters: objectSchema({
       created_after: { type: "string" },
       customer_id: { type: "integer" },
       user_id: { type: "integer" },
       max_pages: { type: "integer" },
-      max_tickets: { type: "integer", description: "How many open tickets to history-digest (1-100, default 50)." },
+      max_tickets: { type: "integer", description: "How many open tickets to include (1-100, default 100)." },
       sort: { type: "string", enum: ["attention", "oldest", "newest", "most_overdue", "updated"] },
-      include_history: { type: "boolean" },
+      include_history: { type: "boolean", description: "Default false for brief rundowns. True only for full history digests." },
     }),
     schema: summarizeOpenTicketsSchema,
     run: (args, syncro, runtime) => summarizeOpenTickets(syncro, summarizeOpenTicketsSchema.parse(args), runtime),
@@ -2032,7 +2089,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     dueSoonHours: input.dueSoonHours,
     authorize: input.authorize,
   };
-  const toolJsonCap = mode === "intelligence" ? 28_000 : 48_000;
+  const toolJsonCap = mode === "intelligence" ? 100_000 : 120_000;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
     if (Date.now() > deadline) {
       throw new AppError("That request took too long. Try a narrower question.", "turn_timeout", true);
@@ -2056,7 +2113,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
         else result = { error: `Could not run ${call.function.name}.` };
       }
       toolResults.push(result);
-      const serialized = capJson(redactForModel(JSON.stringify(result)), toolJsonCap);
+      const serialized = serializeToolResult(result, toolJsonCap);
       messages.push({ role: "tool", tool_call_id: call.id, content: serialized });
     }
   }

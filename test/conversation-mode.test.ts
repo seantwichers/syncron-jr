@@ -39,7 +39,8 @@ describe("mode prompts", () => {
   it("bakes anti-regurgitation rules into intelligence system prompt", () => {
     const prompt = buildSystemPrompt("intelligence");
     expect(prompt).toMatch(/Anti-regurgitation/i);
-    expect(prompt).toMatch(/Do NOT paste ticket inventories/i);
+    expect(prompt).toMatch(/Do NOT paste raw Syncro field dumps/i);
+    expect(prompt).toMatch(/summarize_open_tickets/i);
     expect(buildModePrompt("intelligence")).toMatch(/Recommended next move/i);
   });
 
