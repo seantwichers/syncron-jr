@@ -49,6 +49,9 @@ type QueryValue = string | number | boolean;
 type Query = Record<string, QueryValue | undefined>;
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
+/** Cloudflare Workers rejects unbound `fetch` (`Illegal invocation`). */
+const boundFetch: FetchLike = (input, init) => fetch(input, init);
+
 interface JsonSchemaProperty {
   type: "string" | "integer" | "number" | "boolean";
   description?: string;
@@ -392,7 +395,7 @@ export class SyncroClient {
     this.apiKey = options.apiKey;
     this.timeoutMs = options.timeoutMs ?? 20_000;
     this.maxPages = options.maxPages ?? 4;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? boundFetch;
     this.authorizeRequest = options.authorize;
     this.budget = options.budget;
   }
@@ -410,7 +413,8 @@ export class SyncroClient {
     }
     let response: Response;
     try {
-      response = await this.fetchImpl(url, {
+      // Pass a string URL — some Worker runtimes mishandle URL objects on fetch.
+      response = await this.fetchImpl(url.href, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
@@ -423,7 +427,8 @@ export class SyncroClient {
       if (name === "TimeoutError" || name === "AbortError") {
         throw new AppError("Syncro took too long to respond.", "syncro_timeout", true);
       }
-      throw new AppError("Could not reach Syncro.", "syncro_network", true);
+      const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      throw new AppError(`Could not reach Syncro. (${detail.slice(0, 120)})`, "syncro_network", true);
     }
     const body = await response.text();
     if (!response.ok) {
@@ -1703,7 +1708,7 @@ async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolC
     "Content-Type": "application/json",
   };
   if (input.llm.provider === "openrouter") headers["X-Title"] = "MSP Slack Assistant";
-  const fetchImpl = input.fetchImpl ?? fetch;
+  const fetchImpl = input.fetchImpl ?? boundFetch;
   let response: Response;
   try {
     response = await fetchImpl(`${input.llm.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
@@ -2176,7 +2181,7 @@ export async function handleWorkerRequest(
     return new Response("Invalid signature", { status: 401 });
   }
 
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = options.fetchImpl ?? boundFetch;
   const assistant = createAssistant(config, { fetchImpl, memory: options.memory ?? workerMemory });
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("application/x-www-form-urlencoded")) {
