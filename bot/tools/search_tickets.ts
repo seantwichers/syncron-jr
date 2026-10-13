@@ -4,7 +4,7 @@ import { searchTickets, searchTicketsSchema } from "../lib/syncro.js";
 
 export default defineTool({
   description:
-    "Search Syncro tickets. Defaults to open tickets with the documented status filter Not Closed. Priority, overdue, age, unassigned, and customer_reply filters are applied locally because the list endpoint does not document them. Results include an attention order calculated in code.",
+    "Search Syncro tickets. Defaults to open tickets (status=Not Closed). Returns up to 100 tickets (default 50). For a full history digest of every open ticket, prefer summarize_open_tickets.",
   execution: "server",
   effect: "read",
   inputSchema: searchTicketsSchema,

@@ -25,6 +25,7 @@ Keep using tools until you can answer with evidence.
 
 | Ask | Tool |
 | --- | --- |
+| Summary of all open tickets / what happened | `summarize_open_tickets` |
 | Portfolio / concentration / big picture | `digest_open_portfolio` |
 | Multiple APIs at once | `batch_syncro_read` |
 | Complex chained investigation | `run_research_plan` |

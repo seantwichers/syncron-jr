@@ -14,6 +14,7 @@ import {
   redactForModel,
   runResearchPlan,
   searchTickets,
+  summarizeOpenTickets,
   type TicketSummary,
 } from "../bot/lib/syncro.js";
 import { isUserAllowed, parseAllowlist } from "../bot/lib/client.js";
@@ -268,6 +269,62 @@ describe("batchSyncroRead", () => {
     })) as { successCount: number; results: Array<{ label: string; kind?: string }> };
     expect(result.successCount).toBe(2);
     expect(result.results.map((row) => row.label)).toEqual(["billing", "calendar"]);
+  });
+});
+
+describe("summarizeOpenTickets", () => {
+  it("returns history digests for more than 10 open tickets", async () => {
+    const many = Array.from({ length: 12 }, (_, index) =>
+      rawTicket({
+        id: index + 1,
+        number: 1000 + index,
+        subject: `Issue ${index + 1}`,
+        customer_business_then_name: `Customer ${index + 1}`,
+      }),
+    );
+    const syncro = mockSyncro({
+      "/tickets": () => ({
+        tickets: many,
+        meta: { total_pages: 1, total_entries: many.length, per_page: 25 },
+      }),
+      ...Object.fromEntries(
+        many.map((ticket) => [
+          `/tickets/${ticket.id}`,
+          () => ({ ticket }),
+        ]),
+      ),
+      ...Object.fromEntries(
+        many.map((ticket) => [
+          `/tickets/${ticket.id}/comments`,
+          () => ({
+            comments: [
+              {
+                id: Number(ticket.id) * 10,
+                created_at: "2026-10-01T12:00:00.000Z",
+                hidden: false,
+                tech: "Erin Tech",
+                body: `Started work on ticket ${ticket.number}.`,
+              },
+              {
+                id: Number(ticket.id) * 10 + 1,
+                created_at: "2026-10-09T12:00:00.000Z",
+                hidden: true,
+                tech: "Alex Tech",
+                body: "Waiting on parts; customer notified.",
+              },
+            ],
+            meta: { total_pages: 1, total_entries: 2 },
+          }),
+        ]),
+      ),
+    });
+    const result = (await summarizeOpenTickets(syncro, { max_tickets: 50 }, RUNTIME)) as {
+      returned: number;
+      tickets: Array<{ number: number | null; whatHappened: string }>;
+    };
+    expect(result.returned).toBe(12);
+    expect(result.tickets).toHaveLength(12);
+    expect(result.tickets[0]?.whatHappened).toMatch(/Started work|Waiting on parts/);
   });
 });
 
