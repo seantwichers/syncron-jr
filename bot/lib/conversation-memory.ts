@@ -3,6 +3,12 @@
  * Keeps recent turns plus a rolling director briefing so follow-ups stay coherent.
  */
 
+import {
+  DEFAULT_CONVERSATION_MODE,
+  isConversationMode,
+  type ConversationMode,
+} from "./conversation-mode.js";
+
 export interface StoredMessage {
   role: "user" | "assistant";
   content: string;
@@ -12,6 +18,8 @@ export interface ConversationState {
   messages: StoredMessage[];
   /** Compact rolling briefing of prior discussion (entities, decisions, open threads). */
   briefing: string;
+  /** Active reply style for this conversation. Defaults to intelligence. */
+  mode: ConversationMode;
   updatedAt: number;
 }
 
@@ -134,7 +142,31 @@ export class ConversationMemory {
   }
 
   private empty(now = Date.now()): ConversationState {
-    return { messages: [], briefing: "", updatedAt: now };
+    return {
+      messages: [],
+      briefing: "",
+      mode: DEFAULT_CONVERSATION_MODE,
+      updatedAt: now,
+    };
+  }
+
+  private normalizeState(parsed: ConversationState, now: number): ConversationState | null {
+    if (
+      !parsed ||
+      !Array.isArray(parsed.messages) ||
+      typeof parsed.updatedAt !== "number" ||
+      this.expired(parsed, now)
+    ) {
+      return null;
+    }
+    return {
+      messages: parsed.messages
+        .filter((message) => message && (message.role === "user" || message.role === "assistant") && typeof message.content === "string")
+        .map((message) => ({ role: message.role, content: message.content })),
+      briefing: typeof parsed.briefing === "string" ? parsed.briefing : "",
+      mode: isConversationMode(parsed.mode) ? parsed.mode : DEFAULT_CONVERSATION_MODE,
+      updatedAt: parsed.updatedAt,
+    };
   }
 
   private expired(state: ConversationState, now: number): boolean {
@@ -147,6 +179,7 @@ export class ConversationMemory {
       return {
         messages: local.messages.map((message) => ({ ...message })),
         briefing: local.briefing,
+        mode: isConversationMode(local.mode) ? local.mode : DEFAULT_CONVERSATION_MODE,
         updatedAt: local.updatedAt,
       };
     }
@@ -155,23 +188,13 @@ export class ConversationMemory {
         const raw = await this.backend.get(this.storageKey(key));
         if (raw) {
           const parsed = JSON.parse(raw) as ConversationState;
-          if (
-            parsed &&
-            Array.isArray(parsed.messages) &&
-            typeof parsed.updatedAt === "number" &&
-            !this.expired(parsed, now)
-          ) {
-            const state: ConversationState = {
-              messages: parsed.messages
-                .filter((message) => message && (message.role === "user" || message.role === "assistant") && typeof message.content === "string")
-                .map((message) => ({ role: message.role, content: message.content })),
-              briefing: typeof parsed.briefing === "string" ? parsed.briefing : "",
-              updatedAt: parsed.updatedAt,
-            };
+          const state = this.normalizeState(parsed, now);
+          if (state) {
             this.entries.set(key, state);
             return {
               messages: state.messages.map((message) => ({ ...message })),
               briefing: state.briefing,
+              mode: state.mode,
               updatedAt: state.updatedAt,
             };
           }
@@ -194,6 +217,26 @@ export class ConversationMemory {
     return state.briefing;
   }
 
+  async getMode(key: string, now = Date.now()): Promise<ConversationMode> {
+    const state = await this.load(key, now);
+    return state.mode;
+  }
+
+  async setMode(key: string, mode: ConversationMode, now = Date.now()): Promise<ConversationState> {
+    const state = await this.load(key, now);
+    state.mode = mode;
+    state.updatedAt = now;
+    this.entries.set(key, state);
+    this.evictIfNeeded(key);
+    await this.persist(key, state);
+    return {
+      messages: state.messages.map((message) => ({ ...message })),
+      briefing: state.briefing,
+      mode: state.mode,
+      updatedAt: state.updatedAt,
+    };
+  }
+
   async appendTurn(
     key: string,
     userText: string,
@@ -214,6 +257,7 @@ export class ConversationMemory {
     return {
       messages: state.messages.map((message) => ({ ...message })),
       briefing: state.briefing,
+      mode: state.mode,
       updatedAt: state.updatedAt,
     };
   }

@@ -12,6 +12,11 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { App } from "@slack/bolt";
 import { z } from "zod";
 import {
+  modeSwitchAck,
+  parseModeSwitch,
+  type ConversationMode,
+} from "./bot/lib/conversation-mode.js";
+import {
   ConversationMemory,
   kvBackendFromBinding,
   slackMemoryKey,
@@ -83,10 +88,12 @@ const ATTENTION_ORDER = [
 
 const HELP_TEXT = [
   "I'm Syncron Jr — an MSP intelligence agent for directors and service managers.",
+  "Default is *conversation mode*: I synthesize patterns, risks, and actions — I don't restate Syncro screens.",
+  "Say *lookup mode* for short factual lists, or *conversation mode* to switch back.",
   "Examples:",
   "• Analyze the last 90 days: top recurring technical problems and what to fix first.",
   "• Compare this month's ticket/labor trends to the prior period.",
-  "• Summarize all open tickets with what happened on each.",
+  "• What's the real risk in our open queue right now?",
   "Read-only Syncro. I cite evidence and say when data is incomplete.",
 ].join("\n");
 
@@ -1820,6 +1827,8 @@ export interface RunAgentInput {
   history: StoredMessage[];
   /** Rolling director briefing from prior turns in this conversation. */
   conversationBriefing?: string;
+  /** Reply style: intelligence (default) synthesizes; lookup stays factual. */
+  conversationMode?: ConversationMode;
   userText: string;
   now?: Date;
   dueSoonHours: number;
@@ -1919,9 +1928,10 @@ function toSlackMrkdwn(text: string): string {
 }
 
 async function completeChat(input: RunAgentInput, messages: ChatMessage[], toolChoice: "auto" | "none"): Promise<ChatMessage> {
+  const temperature = input.conversationMode === "lookup" ? 0.1 : 0.25;
   const payload = {
     model: input.llm.model,
-    temperature: 0.15,
+    temperature,
     max_tokens: 8000,
     messages,
     tools: TOOLS.map((tool) => ({
@@ -1997,6 +2007,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
   input.authorize();
   const now = input.now ?? new Date();
   const deadline = input.deadlineMs ?? Date.now() + TURN_BUDGET_MS;
+  const mode = input.conversationMode ?? "intelligence";
   const briefing = input.conversationBriefing?.trim();
   const memoryBlock = briefing
     ? [
@@ -2006,7 +2017,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
       ].join("\n")
     : "Conversation memory: no prior briefing for this chat yet.";
   const messages: ChatMessage[] = [
-    { role: "system", content: buildSystemPrompt() },
+    { role: "system", content: buildSystemPrompt(mode) },
     { role: "system", content: memoryBlock },
     ...input.history.map((message) => ({ role: message.role, content: message.content })),
     {
@@ -2021,6 +2032,7 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
     dueSoonHours: input.dueSoonHours,
     authorize: input.authorize,
   };
+  const toolJsonCap = mode === "intelligence" ? 28_000 : 48_000;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
     if (Date.now() > deadline) {
       throw new AppError("That request took too long. Try a narrower question.", "turn_timeout", true);
@@ -2044,13 +2056,20 @@ export async function runAgentTurn(input: RunAgentInput): Promise<string> {
         else result = { error: `Could not run ${call.function.name}.` };
       }
       toolResults.push(result);
-      const serialized = capJson(redactForModel(JSON.stringify(result)), 48_000);
+      const serialized = capJson(redactForModel(JSON.stringify(result)), toolJsonCap);
       messages.push({ role: "tool", tool_call_id: call.id, content: serialized });
     }
   }
+  const stopInstruction = mode === "intelligence"
+    ? [
+        "Stop calling tools. Answer from the tool results already collected.",
+        "Conversation mode: write a director briefing — executive finding, evidence anchors, interpretation, recommended action, confidence.",
+        "Do not regurgitate Syncro fields or paste ticket inventories. If evidence is insufficient, say what is missing.",
+      ].join(" ")
+    : "Stop calling tools. Answer from the tool results already collected. If they are insufficient, say what is missing.";
   messages.push({
     role: "user",
-    content: "Stop calling tools. Answer from the tool results already collected. If they are insufficient, say what is missing.",
+    content: stopInstruction,
   });
   const finalMessage = await completeChat(input, messages, "none");
   const reply = finalMessage.content?.trim();
@@ -2064,15 +2083,33 @@ export interface HandleTextOptions {
   text: string;
   memory: ConversationMemory;
   allowedUserIds: Set<string> | null;
-  respond: (history: StoredMessage[], text: string, briefing: string) => Promise<string>;
+  respond: (
+    history: StoredMessage[],
+    text: string,
+    briefing: string,
+    mode: ConversationMode,
+  ) => Promise<string>;
 }
 
 export async function handleUserText(options: HandleTextOptions): Promise<string> {
   if (!isUserAllowed(options.slackUserId, options.allowedUserIds)) throw new AuthorizationError();
   const text = truncate(options.text, 2000);
   if (!text || /^help$/i.test(text)) return HELP_TEXT;
+
+  const modeSwitch = parseModeSwitch(text);
+  if (modeSwitch) {
+    await options.memory.setMode(options.memoryKey, modeSwitch.mode);
+    if (modeSwitch.switchOnly) {
+      const ack = modeSwitchAck(modeSwitch.mode);
+      await options.memory.appendTurn(options.memoryKey, text, ack);
+      return ack;
+    }
+  }
+
   const state = await options.memory.load(options.memoryKey);
-  const reply = await options.respond(state.messages, text, state.briefing);
+  const mode = modeSwitch?.mode ?? state.mode;
+  const question = modeSwitch?.remainder ?? text;
+  const reply = await options.respond(state.messages, question, state.briefing, mode);
   await options.memory.appendTurn(options.memoryKey, text, reply);
   return reply;
 }
@@ -2173,12 +2210,19 @@ function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
   const secrets = [config.syncroApiKey, config.slackBotToken, config.slackSigningSecret, config.llmApiKey];
   if (config.slackAppToken) secrets.push(config.slackAppToken);
 
-  const respond = (slackUserId: string, history: StoredMessage[], text: string, briefing: string) =>
+  const respond = (
+    slackUserId: string,
+    history: StoredMessage[],
+    text: string,
+    briefing: string,
+    mode: ConversationMode,
+  ) =>
     budgetStore.run(new RequestBudget(MAX_REQUESTS_PER_TURN), () =>
       principalStore.run({ slackUserId }, () => runAgentTurn({
         syncro,
         history,
         conversationBriefing: briefing,
+        conversationMode: mode,
         userText: text,
         dueSoonHours: config.dueSoonHours,
         authorize: () => authorizeSlack(config.allowedUserIds),
@@ -2211,14 +2255,19 @@ function createAssistant(config: ServerConfig, options: AssistantOptions = {}) {
         await post(HELP_TEXT);
         return;
       }
-      await post("Checking Syncro…");
+      const pendingSwitch = parseModeSwitch(trimmed);
+      if (!pendingSwitch?.switchOnly) {
+        const activeMode = pendingSwitch?.mode ?? await memory.getMode(memoryKey);
+        await post(activeMode === "lookup" ? "Checking Syncro…" : "Thinking through the ops picture…");
+      }
       const reply = await handleUserText({
         memoryKey,
         slackUserId,
         text: trimmed,
         memory,
         allowedUserIds: config.allowedUserIds,
-        respond: (history, userText, briefing) => respond(slackUserId, history, userText, briefing),
+        respond: (history, userText, briefing, mode) =>
+          respond(slackUserId, history, userText, briefing, mode),
       });
       for (const chunk of chunkSlackText(reply)) await post(chunk);
     } catch (error) {

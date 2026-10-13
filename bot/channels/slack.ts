@@ -27,16 +27,16 @@ export default slackChannel({
   onDirectMessage: handleSlack,
   suggestedPrompts: [
     {
-      title: "Overdue first",
-      message: "Show me overdue tickets and tell me which ones need attention first.",
+      title: "Ops risk brief",
+      message: "What's the real operational risk in our open queue right now, and what should we do first?",
     },
     {
-      title: "Oldest ticket",
-      message: "What should we do about the oldest open ticket?",
+      title: "Recurring problems",
+      message: "Analyze the last 90 days: top recurring technical problems and what we should fix first.",
     },
     {
-      title: "Heavy queues",
-      message: "Who has the heaviest open queue?",
+      title: "Conversation mode",
+      message: "conversation mode",
     },
   ],
   suggestedPromptsTitle: "Ask Syncron Jr",
